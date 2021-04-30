@@ -29,7 +29,7 @@ typedef struct _FILM_MEASURE_INFO {
 					*cv_refl,						/* Reflectance (calculated from measurements) */
 					*cv_fit,							/* Fit reflectance (simulation) */
 					*cv_residual;					/* Residual error */
-	double *tfoc_refl;							/* TFOC of reference structure */
+	double *tfoc_reference;						/* TFOC of reference structure */
 	double *tfoc_fit;								/* TFOC of sample structure */
 
 	struct {
@@ -60,8 +60,10 @@ typedef struct _FILM_MEASURE_INFO {
 #define	WMP_UPDATE_MAIN_AXIS_SCALES	(WM_APP+6)
 #define	WMP_PROCESS_REFERENCE			(WM_APP+7)
 #define	WMP_PROCESS_MEASUREMENT			(WM_APP+8)
-#define	WMP_MAKE_REFERENCE_STACK		(WM_APP+9)
+#define	WMP_CLEAR_SAMPLE_STACK			(WM_APP+9)
 #define	WMP_MAKE_SAMPLE_STACK			(WM_APP+10)
+#define	WMP_CLEAR_REFERENCE_STACK		(WM_APP+11)
+#define	WMP_MAKE_REFERENCE_STACK		(WM_APP+12)
 
 #define	ID_NULL			(-1)
 
