@@ -15,6 +15,8 @@
 #include <stddef.h>					  /* for defining several useful types and macros */
 #include <stdio.h>					  /* for performing input and output */
 #include <stdlib.h>					  /* for performing a variety of operations */
+#include <stdarg.h>
+#include <errno.h>
 #include <string.h>
 #include <math.h>						  /* basic math functions */
 #include <float.h>
@@ -22,6 +24,7 @@
 #include <assert.h>
 #include <stdint.h>				     /* C99 extension to get known width integers */
 #include <time.h>
+#include <io.h>							/* Contains _findfirst */
 #include <sys/types.h>
 #include <sys/stat.h>
 
@@ -62,18 +65,6 @@
 	#define	PATH_MAX	260
 #endif
 
-static CB_INT_LIST materials[] = {
-	{"none", 0},
-	{"c-Si", 1},
-	{"a-Si", 2},
-	{"SiO2", 3},
-	{"S1800", 4},
-	{"S1800_exp", 5},
-	{"S1800_unexp", 6},
-	{"Bi2O3", 7},
-	{"TiO2", 8}
-};
-
 /* ------------------------------- */
 /* My external function prototypes */
 /* ------------------------------- */
@@ -92,11 +83,18 @@ static int Acquire_Raw_Spectrum(HWND hdlg, FILM_MEASURE_INFO *info, SPEC_SPECTRU
 
 TFOC_SAMPLE *MakeSample(int nlayers, FILM_LAYERS *film);
 int TFOC_GetReflData(TFOC_SAMPLE *sample, double scaling, double theta, POLARIZATION mode, double temperature, int npt, double *lambda, double *refl);
+static char *Find_TFOC_Database(char *database, size_t len, int *ierr);
+
+static int InitMaterialsList(void);
+static int FindMaterialIndex(char *text, char **endptr);
 
 static int CalcChiSqr(double *x, double *y, double *s, double *yfit, int npt, double xmin, double xmax, double *pchisqr, int *pdof);
 static int do_fit(HWND hdlg, FILM_MEASURE_INFO *info);
 static int SaveData(FILM_MEASURE_INFO *info, char *fname);
 static int LoadData(FILM_MEASURE_INFO *info, char *path);
+
+static int WriteProfileInfo(HWND hdlg, FILM_MEASURE_INFO *info);
+static int ReadProfileInfo(HWND hdlg, FILM_MEASURE_INFO *info);
 
 /* ------------------------------- */
 /* My usage of other external fncs */
@@ -105,13 +103,18 @@ static int LoadData(FILM_MEASURE_INFO *info, char *path);
 /* ------------------------------- */
 /* My share of global externals    */
 /* ------------------------------- */
-FILM_MEASURE_INFO *main_info = NULL;
+static FILM_MEASURE_INFO *main_info = NULL;
+static char *IniFile = "./FilmMeasure.ini";				/* Initialization information */
 	
 /* ------------------------------- */
 /* Locally defined global vars     */
 /* ------------------------------- */
 static HINSTANCE hInstance=NULL;
 static HWND main_hdlg = NULL;					/* Handle to primary dialog box */
+
+static CB_INT_LIST *materials = NULL;
+static int materials_dim=0;											/* Dimensioned size */
+static int materials_cnt=0;
 
 static int colors[7] = {						/* Color scheme for the graphs (and the legend) */
 	RGB(200,200,0),	/* Raw spectra - yellowish */
@@ -146,13 +149,23 @@ int WINAPI WinMain(HINSTANCE hThisInst, HINSTANCE hPrevInst, LPSTR lpszArgs, int
 
 	/* And show the dialog box */
 	hInstance = hThisInst;
-	DialogBox(hInstance, "FILMMEASURE_DIALOG", HWND_DESKTOP, (DLGPROC) MainDlgProc);
+	DialogBoxParam(hInstance, "FILMMEASURE_DIALOG", HWND_DESKTOP, (DLGPROC) MainDlgProc, (LPARAM) main_info);			/* For re-entrant, use the previous saved values */
 
 	return 0;
 }
 
 /* ===========================================================================
-
+-- Main dialog processing routine
+--
+-- Usage: INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam);
+--
+-- Inputs: hdlg - dialog box handle
+--         msg  - what to do
+--         wParam, lParam - parameters to the operatations
+--
+-- Output: lots of side effects
+--
+-- Return: return code, generally BOOL
 =========================================================================== */
 #define	TIMER_SPEC_UPDATE			(3)
 
@@ -161,7 +174,7 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 
 	BOOL rcode, enable;
 	int wID, wNotifyCode;
-	int i, icnt, rc;
+	int i, nvary, ilayer, rc;
 	char szBuf[256];
 
 	FILM_LAYERS *stack;
@@ -223,19 +236,44 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 			sprintf_s(szBuf, sizeof(szBuf), "Version 1.0: %s", LinkDate);
 			SetDlgItemText(hdlg, IDT_COMPILE_VERSION, szBuf);
 
-			main_info = info = (FILM_MEASURE_INFO *) calloc(1, sizeof(*info));
-			SetWindowLongPtr(hdlg, GWLP_USERDATA, (LONG) info);
+			/* Initialize the materials database */
+			if (InitMaterialsList() <= 1) {
+				MessageBox(hdlg, "Unable to locate the materials n,k database.  Normally the database is the subdirectory \"database.nk\".", "FilmMeasure initialize failure", MB_ICONERROR | MB_OK);
+				EndDialog(hdlg, 3);			/* Fatal error */
+			}
 
-			/* Initialize parameters in the info structure */
-			info->hdlg = main_hdlg = hdlg;				/* Have this available for other use */
-			info->lambda_min = 200.0;						/* Graph X-range limits */
-			info->lambda_max = 900.0;
-			info->lambda_autoscale = TRUE;
-			info->fit_parms.lambda_min  = 300.0;		/* Fitting parameters */
-			info->fit_parms.lambda_max  = 800.0;
-			info->fit_parms.scaling_min = 0.95;
-			info->fit_parms.scaling_max = 1.05;
-			info->fit_parms.scaling     = 1.0;
+			/* See if we have been passed an INFO structure to use (pre-initialized) */
+			/* At the moment, we clear the structure on exit so can't be repassed, but may change in future */
+			if ( (info = (FILM_MEASURE_INFO *) lParam) != NULL) {		/* Already exists */
+				if (info->magic != FILM_MEASURE_MAGIC) {
+					MessageBox(hdlg, "Passed FilmMeasure info structure was invalid.  Not sure how to proceed so abaonding the request to open", "FilmMeasure initialize failure", MB_ICONERROR | MB_OK);
+					EndDialog(hdlg, 3);			/* Fatal error */
+				} else if (info->hdlg != NULL) {
+					MessageBox(hdlg, "Passed FilmMeasure info structure in use by another dialog.  Cannot have two sharing the same info", "FilmMeasure initialize failure", MB_ICONERROR | MB_OK);
+					EndDialog(hdlg, 3);			/* Fatal error */
+				}
+			} else if ( (main_info = info = (FILM_MEASURE_INFO *) calloc(1, sizeof(*info))) == NULL) {
+				MessageBox(hdlg, "Unable to initialize a FilmMeasure info structure.  Unable to continue.", "FilmMeasure initialize failure", MB_ICONERROR | MB_OK);
+				EndDialog(hdlg, 3);			/* Fatal error */
+			} else {
+				info->magic = FILM_MEASURE_MAGIC;			/* Initialize parameters in the info structure */
+				info->hdlg = hdlg;								/* Save for use and mark this info structure in use */
+				info->lambda_min = 200.0;						/* Graph X-range limits */
+				info->lambda_max = 900.0;
+				info->lambda_autoscale = TRUE;
+				info->fit_parms.lambda_min  = 300.0;		/* Fitting parameters */
+				info->fit_parms.lambda_max  = 800.0;
+				info->fit_parms.scaling_min = 0.95;
+				info->fit_parms.scaling_max = 1.05;
+				info->fit_parms.scaling     = 1.0;
+				info->reference.substrate = FindMaterialIndex("c-Si", NULL);
+				if (info->reference.substrate <= 0) info->reference.substrate = 1;
+				info->sample.substrate = FindMaterialIndex("c-Si", NULL);
+				if (info->sample.substrate <= 0) info->reference.substrate = 1;
+			}
+
+			/* Save the information structure in the dialog box info parameter */
+			SetWindowLongPtr(hdlg, GWLP_USERDATA, (LONG) info);
 
 			/* Copy default IP address and try to connect to the LasGo client/server */
 			/* Due to the possible timeouts on making connections, do as a thread */
@@ -248,7 +286,29 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 
 			SendMessage(hdlg, WMP_UPDATE_SPEC_PARMS, 0, 0);					/* Also updates the graphs */
 
+			/* Load the combo boxes from the database for the sample */
+			for (i=0; i<N_FILM_STACK; i++) {
+				ComboBoxClearList(hdlg, IDC_FILM_MATERIAL_0+i);
+				ComboBoxFillIntList(hdlg, IDC_FILM_MATERIAL_0+i, materials, materials_cnt);
+			}
+			ComboBoxClearList(hdlg, IDC_FILM_SUBSTRATE);
+			ComboBoxFillIntList(hdlg, IDC_FILM_SUBSTRATE, materials, materials_cnt);
+
+			/* Load the combo boxes from the database for the reference */
+			for (i=0; i<N_FILM_STACK; i++) {
+				ComboBoxClearList(hdlg, IDC_REF_MATERIAL_0+i);
+				ComboBoxFillIntList(hdlg, IDC_REF_MATERIAL_0+i, materials, materials_cnt);
+			}
+			ComboBoxClearList(hdlg, IDC_REF_SUBSTRATE);
+			ComboBoxFillIntList(hdlg, IDC_REF_SUBSTRATE, materials, materials_cnt);
+
+			/* Reset to previous state via profile structure if available */
+			ReadProfileInfo(hdlg, info);								/* Loads parameters and modifies sample/reference */
+
+			/* Finally .. transfer parameters from INFO to the dialog box */
 			/* Autoscale and manual wavelength ranges for graph */
+			SendMessage(hdlg, WMP_SHOW_SAMPLE_STRUCTURE, 0, 0);
+			SendMessage(hdlg, WMP_SHOW_REFERENCE_STRUCTURE, 0, 0);
 			SetDlgItemCheck(hdlg, IDC_AUTORANGE_WAVELENGTH, info->lambda_autoscale);
 			SetDlgItemDouble(hdlg, IDV_GRAPH_LAMBDA_MIN, "%.1f", info->lambda_min);
 			SetDlgItemDouble(hdlg, IDV_GRAPH_LAMBDA_MAX, "%.1f", info->lambda_max);
@@ -259,28 +319,8 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 			SetDlgItemDouble(hdlg, IDV_FIT_LAMBDA_MIN,  "%.1f", info->fit_parms.lambda_min);
 			SetDlgItemDouble(hdlg, IDV_FIT_LAMBDA_MAX,  "%.1f", info->fit_parms.lambda_max);
 			SetDlgItemDouble(hdlg, IDV_FIT_SCALING,     "%.3f", info->fit_parms.scaling);
-			SetDlgItemDouble(hdlg, IDV_FIT_SCALING_MIN, "%.1f", info->fit_parms.scaling_min);
-			SetDlgItemDouble(hdlg, IDV_FIT_SCALING_MAX, "%.1f", info->fit_parms.scaling_max);
-
-			/* Fill in the combo boxes for the sample */
-			for (i=0; i<N_FILM_STACK; i++) {
-				ComboBoxClearList(hdlg, IDC_FILM_MATERIAL_0+i);
-				ComboBoxFillIntList(hdlg, IDC_FILM_MATERIAL_0+i, materials, CB_COUNT(materials));
-				ComboBoxSetByIntValue(hdlg, IDC_FILM_MATERIAL_0+i, 0);
-			}
-			ComboBoxClearList(hdlg, IDC_FILM_SUBSTRATE);
-			ComboBoxFillIntList(hdlg, IDC_FILM_SUBSTRATE, materials, CB_COUNT(materials));
-			ComboBoxSetByIntValue(hdlg, IDC_FILM_SUBSTRATE, 1);
-
-			/* Fill in the combo boxes for the reference film */
-			for (i=0; i<N_FILM_STACK; i++) {
-				ComboBoxClearList(hdlg, IDC_REF_MATERIAL_0+i);
-				ComboBoxFillIntList(hdlg, IDC_REF_MATERIAL_0+i, materials, CB_COUNT(materials));
-				ComboBoxSetByIntValue(hdlg, IDC_REF_MATERIAL_0+i, 0);
-			}
-			ComboBoxClearList(hdlg, IDC_REF_SUBSTRATE);
-			ComboBoxFillIntList(hdlg, IDC_REF_SUBSTRATE, materials, CB_COUNT(materials));
-			ComboBoxSetByIntValue(hdlg, IDC_REF_SUBSTRATE, 1);
+			SetDlgItemDouble(hdlg, IDV_FIT_SCALING_MIN, "%.2f", info->fit_parms.scaling_min);
+			SetDlgItemDouble(hdlg, IDV_FIT_SCALING_MAX, "%.2f", info->fit_parms.scaling_max);
 
 			/* Start the timers */
 			SetTimer(hdlg, TIMER_SPEC_UPDATE, 1000, NULL);					/* Update spectrometer parameters seconds (if live) */
@@ -288,8 +328,20 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 
 		case WM_CLOSE:
 			if (info->spec_ok) { Shutdown_Spec_Client();	info->spec_ok = FALSE; }
-			info->hdlg = NULL;
-			free(info);
+			WriteProfileInfo(hdlg, info);
+			info->hdlg = NULL;								/* Mark info structure as no longer in use */
+			{
+				info->magic = 0;								/* For now, disable ability to reload this dialog */
+				SendDlgItemMessage(hdlg, IDU_RAW_GRAPH, WMP_CLEAR, 0, 0);			/* Free all curves */
+				SendDlgItemMessage(hdlg, IDU_GRAPH,     WMP_CLEAR, 0, 0);			/* Free all curves */
+				info->cv_raw = info->cv_dark = info->cv_ref = info->cv_light = NULL;
+				info->cv_refl = info->cv_fit = info->cv_residual = NULL;
+				if (info->lambda != NULL) { free(info->lambda); info->lambda = NULL; }
+				info->lambda_transferred = FALSE;
+				if (info->tfoc_reference != NULL) { free(info->tfoc_reference); info->tfoc_reference = NULL; }
+				if (info->tfoc_fit != NULL) { free(info->tfoc_fit); info->tfoc_fit = NULL; }
+				free(info);										/* Which means we can free the structure */
+			}
 			EndDialog(hdlg,0);
 			rcode = TRUE; break;
 
@@ -531,28 +583,45 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 			rcode = TRUE; break;
 
 		case WMP_CLEAR_REFERENCE_STACK:
-			ComboBoxSetByIntValue(hdlg, IDC_REF_SUBSTRATE, 1);			/* Set substrate as c-Si */
+			info->reference.mirror = FALSE;
+			info->reference.substrate = FindMaterialIndex("c-Si", NULL);
+			if (info->reference.substrate <= 0) info->reference.substrate = 1;
 			for (i=0; i<N_FILM_STACK; i++) {
-				ComboBoxSetByIntValue(hdlg, IDC_REF_MATERIAL_0+i, 0);	/* Mark as empty */
-				SetDlgItemText(hdlg, IDV_REF_NM_0+i,    "");
-				EnableDlgItem(hdlg, IDV_REF_NM_0+i,    FALSE);
+				info->reference.imat[i] = 0;							/* Mark as empty */
+				info->reference.nm[i] = 0;
 			}
+			SendMessage(hdlg, WMP_SHOW_REFERENCE_STRUCTURE, 0, 0);
+			rcode = TRUE; break;
+
+		case WMP_SHOW_REFERENCE_STRUCTURE:
+			for (i=0; i<N_FILM_STACK; i++) {
+				ComboBoxSetByIntValue(hdlg, IDC_REF_MATERIAL_0+i, info->reference.imat[i]);
+				SetDlgItemDouble(hdlg, IDV_REF_NM_0+i, "%.1f", info->reference.nm[i]);
+			}
+			ComboBoxSetByIntValue(hdlg, IDC_REF_SUBSTRATE, info->reference.substrate);
+			SetDlgItemCheck(hdlg, IDC_REF_MIRROR, info->reference.mirror);
+
+			/* Figure out what is enabled */
+			for (i=0; i<N_FILM_STACK; i++) {							
+				EnableDlgItem(hdlg, IDC_REF_MATERIAL_0+i, ! info->reference.mirror);
+				EnableDlgItem(hdlg, IDV_REF_NM_0+i,       ! info->reference.mirror && info->reference.imat[i] != 0);
+			}
+			EnableDlgItem(hdlg, IDC_REF_SUBSTRATE, ! info->reference.mirror);
 			rcode = TRUE; break;
 
 		case WMP_MAKE_REFERENCE_STACK:
 			nlayers = 0;															/* Must have substrate though */
 			stack = info->reference.stack;									/* Sample stack structure */
 			for (i=0; i<N_FILM_STACK; i++) {
-				imat = ComboBoxGetIntValue(hdlg, IDC_REF_MATERIAL_0+i);
+				imat = info->reference.imat[i];
 				if (imat > 0) {													/* Any layer here? */
 					sprintf_s(stack[nlayers].layer_name, sizeof(stack[nlayers].layer_name), "reference layer %d", i+1);
 					strcpy_s(stack[nlayers].material, sizeof(stack[nlayers].material), materials[imat].id);
-					stack[nlayers].nm = GetDlgItemDouble(hdlg, IDV_REF_NM_0+i);
+					stack[nlayers].nm = info->reference.nm[i];
 					nlayers++;
 				}
 			}
-			imat = ComboBoxGetIntValue(hdlg, IDC_REF_SUBSTRATE);
-			if (imat <= 0) imat = 1;
+			imat = max(1, info->reference.substrate);
 			sprintf_s(stack[nlayers].layer_name, sizeof(stack[nlayers].layer_name), "reference substrate");
 			strcpy_s(stack[nlayers].material, sizeof(stack[nlayers].material), materials[imat].id);
 			stack[nlayers].nm = 100.0;			/* Doesn't matter */
@@ -564,42 +633,55 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 			rcode = TRUE; break;
 
 		case WMP_CLEAR_SAMPLE_STACK:
-			ComboBoxSetByIntValue(hdlg, IDC_FILM_SUBSTRATE, 1);		/* Set substrate as c-Si */
+			info->sample.substrate = FindMaterialIndex("c-Si", NULL);
+			if (info->sample.substrate <= 0) info->sample.substrate = 1;
 			for (i=0; i<N_FILM_STACK; i++) {
-				ComboBoxSetByIntValue(hdlg, IDC_FILM_MATERIAL_0+i, 0);	/* Mark as empty */
-				SetDlgItemText(hdlg, IDV_FILM_NM_0+i,    "");
-				SetDlgItemText(hdlg, IDT_SIGMA_0+i,		  "");
-				SetDlgItemText(hdlg, IDV_NM_LOW_0+i,     "");
-				SetDlgItemText(hdlg, IDV_NM_HIGH_0+i,    "");
-				SetDlgItemCheck(hdlg, IDC_VARY_0+i,     FALSE);
-
-				EnableDlgItem(hdlg, IDV_FILM_NM_0+i,    FALSE);
-				EnableDlgItem(hdlg, IDT_SIGMA_0+i,		 FALSE);
-				EnableDlgItem(hdlg, IDV_NM_LOW_0+i,     FALSE);
-				EnableDlgItem(hdlg, IDV_NM_HIGH_0+i,    FALSE);
-				EnableDlgItem(hdlg, IDC_VARY_0+i,       FALSE);
+				info->sample.imat[i] = 0;
+				info->sample.nm[i] = info->sample.tmin[i] = info->sample.tmax[i] = 0.0;
+				info->sample.vary[i] = FALSE;
+				SetDlgItemText(hdlg, IDT_SIGMA_0+i, "");						/* Clear sigma */
 			}
+			SendMessage(hdlg, WMP_SHOW_SAMPLE_STRUCTURE, 0, 0);
+			rcode = TRUE; break;
+
+		case WMP_SHOW_SAMPLE_STRUCTURE:
+			for (i=0; i<N_FILM_STACK; i++) {
+				ComboBoxSetByIntValue(hdlg, IDC_FILM_MATERIAL_0+i, info->sample.imat[i]);
+				SetDlgItemDouble(hdlg, IDV_FILM_NM_0+i, info->sample.vary[i] ? "%.2f" : "%.1f", info->sample.nm[i]);
+				if (info->sample.imat[i] == 0) info->sample.vary[i] = FALSE;
+				SetDlgItemCheck(hdlg, IDC_VARY_0+i, info->sample.vary[i]);
+				if (info->sample.vary[i]) {									/* Either fill in tmin/tmax or blank */
+					SetDlgItemDouble(hdlg, IDV_NM_LOW_0+i, "%.1f", info->sample.tmin[i]);
+					SetDlgItemDouble(hdlg, IDV_NM_HIGH_0+i, "%.1f", info->sample.tmax[i]);
+				} else {
+					SetDlgItemText(hdlg, IDV_NM_LOW_0+i, "");
+					SetDlgItemText(hdlg, IDV_NM_HIGH_0+i, "");
+				}
+				EnableDlgItem(hdlg, IDV_FILM_NM_0+i, info->sample.imat[i] != 0);
+				EnableDlgItem(hdlg, IDC_VARY_0+i,    info->sample.imat[i] != 0);
+				EnableDlgItem(hdlg, IDV_NM_LOW_0+i,  info->sample.vary[i]);
+				EnableDlgItem(hdlg, IDV_NM_HIGH_0+i, info->sample.vary[i]);
+			}
+			ComboBoxSetByIntValue(hdlg, IDC_FILM_SUBSTRATE, info->sample.substrate);
 			rcode = TRUE; break;
 
 		case WMP_MAKE_SAMPLE_STACK:
 			nlayers = 0;															/* Must have substrate though */
 			stack = info->sample.stack;										/* Sample stack structure */
 			for (i=0; i<N_FILM_STACK; i++) {
-				imat = ComboBoxGetIntValue(hdlg, IDC_FILM_MATERIAL_0+i);
+				imat = info->sample.imat[i];
 				if (imat > 0) {													/* Any layer here? */
 					sprintf_s(stack[nlayers].layer_name, sizeof(stack[nlayers].layer_name), "layer %d", i+1);
 					strcpy_s(stack[nlayers].material, sizeof(stack[nlayers].material), materials[imat].id);
-					stack[nlayers].nm = GetDlgItemDouble(hdlg, IDV_FILM_NM_0+i);
-					
-					stack[nlayers].vary = GetDlgItemCheck(hdlg, IDC_VARY_0+i);
-					stack[nlayers].lower = GetDlgItemDouble(hdlg, IDV_NM_LOW_0+i);
-					stack[nlayers].upper = GetDlgItemDouble(hdlg, IDV_NM_HIGH_0+i);
+					stack[nlayers].nm    = info->sample.nm[i];
+					stack[nlayers].vary  = info->sample.vary[i];
+					stack[nlayers].lower = info->sample.tmin[i];
+					stack[nlayers].upper = info->sample.tmax[i];
 					stack[nlayers].sigma = 0.0;
 					nlayers++;
 				}
 			}
-			imat = ComboBoxGetIntValue(hdlg, IDC_FILM_SUBSTRATE);
-			if (imat <= 0) imat = 1;
+			imat = max(1, info->sample.substrate);
 			sprintf_s(stack[nlayers].layer_name, sizeof(stack[nlayers].layer_name), "substrate");
 			strcpy_s(stack[nlayers].material, sizeof(stack[nlayers].material), materials[imat].id);
 			stack[nlayers].nm = 100.0;			/* Doesn't matter */
@@ -616,10 +698,13 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 				double *ref, *actual, *dark, *light, vmax;
 
 				/* Read the current parameters to create a "reference stack" and generate reflectance curve */
-				SendMessage(hdlg, WMP_MAKE_REFERENCE_STACK, 0, 0);
 				info->tfoc_reference = realloc(info->tfoc_reference, info->npt * sizeof(*info->tfoc_reference));
-				TFOC_GetReflData(info->reference.tfoc, 1.0, 0.0, UNPOLARIZED, 300.0, info->npt, info->lambda, info->tfoc_reference);
-
+				if (! info->reference.mirror) {
+					SendMessage(hdlg, WMP_MAKE_REFERENCE_STACK, 0, 0);
+					TFOC_GetReflData(info->reference.tfoc, 1.0, 0.0, UNPOLARIZED, 300.0, info->npt, info->lambda, info->tfoc_reference);
+				} else {
+					for (i=0; i<info->npt; i++) info->tfoc_reference[i] = 1.0;
+				}
 				cv     = info->cv_light = ReallocLightCurve(hdlg, info, info->cv_light, info->npt, 3, "light", colors[3]);
 				dark   = (info->cv_dark != NULL) ? info->cv_dark->y : NULL ;
 				actual = info->tfoc_reference;
@@ -915,10 +1000,20 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 					}
 					rcode = TRUE; break;
 
+				/* Clear the film stack completely */
+				case IDB_FILM_CLEAR:
+					SendMessage(hdlg, WMP_CLEAR_SAMPLE_STACK, 0, 0);
+					rcode = TRUE; break;
+
 				/* Substrate ... all valid except none */
 				case IDC_FILM_SUBSTRATE:
 					if (wNotifyCode == CBN_SELCHANGE) {
-						if (ComboBoxGetIntValue(hdlg, wID) < 1) ComboBoxSetByIntValue(hdlg, wID, 1);
+						info->sample.substrate = ComboBoxGetIntValue(hdlg, wID);
+						if (info->sample.substrate <= 0) {									/* Don't allow it to be "none" */
+							MessageBeep(MB_ICONERROR);
+							info->sample.substrate = 1;
+							ComboBoxSetByIntValue(hdlg, wID, info->sample.substrate);
+						}
 					}
 					rcode = TRUE; break;
 					
@@ -930,40 +1025,105 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 				case IDC_FILM_MATERIAL_4:
 					if (wNotifyCode == CBN_SELCHANGE) {
 						i = wID - IDC_FILM_MATERIAL_0;
-						enable = ComboBoxGetIntValue(hdlg, wID) >= 1 ;
-						EnableDlgItem(hdlg, IDV_FILM_NM_0+i, enable);
-						EnableDlgItem(hdlg, IDC_VARY_0+i, enable);
-						enable = enable && GetDlgItemCheck(hdlg, IDC_VARY_0+i);
-						EnableDlgItem(hdlg, IDV_NM_LOW_0+i, enable);
-						EnableDlgItem(hdlg, IDV_NM_HIGH_0+i, enable);
+						info->sample.imat[i] = ComboBoxGetIntValue(hdlg, wID);
+						if (info->sample.imat[i] < 0) info->sample.imat[i] = 0;
+						SendMessage(hdlg, WMP_SHOW_SAMPLE_STRUCTURE, 0, 0);			/* Inefficient but so what */
 					}
 					rcode = TRUE; break;
 						
-				/* Thicknesses to vary */
+				/* Mark that the thickness can be varied */
 				case IDC_VARY_0:
 				case IDC_VARY_1:
 				case IDC_VARY_2:
 				case IDC_VARY_3:
 				case IDC_VARY_4:
 					i = wID - IDC_VARY_0;
-					enable = GetDlgItemCheck(hdlg, wID);
-					EnableDlgItem(hdlg, IDV_NM_LOW_0+i, enable);
-					EnableDlgItem(hdlg, IDV_NM_HIGH_0+i, enable);
-					if (enable) {														/* When enabled, set default search range */
-						rval  = GetDlgItemDouble(hdlg, IDV_FILM_NM_0+i);
-						lower = GetDlgItemDouble(hdlg, IDV_NM_LOW_0+i);
-						upper = GetDlgItemDouble(hdlg, IDV_NM_HIGH_0+i);
+					info->sample.vary[i] = GetDlgItemCheck(hdlg, wID);
+					if (info->sample.vary[i]) {									/* When enabled, set default search range */
+						rval  = info->sample.nm[i];
+						lower = info->sample.tmin[i];
+						upper = info->sample.tmax[i];
 						if (lower > rval) lower = 0.0;
 						if (upper < rval || upper > 2.0*rval) upper = max(10.0, 2.0 * rval);
-						SetDlgItemDouble(hdlg, IDV_NM_LOW_0+i,  "%.1f", lower);
-						SetDlgItemDouble(hdlg, IDV_NM_HIGH_0+i, "%.1f", upper);
-						info->sample.stack[i].lower = lower;
-						info->sample.stack[i].upper = upper;
+						info->sample.tmin[i] = lower;
+						info->sample.tmax[i] = upper;
+					}
+					SendMessage(hdlg, WMP_SHOW_SAMPLE_STRUCTURE, 0, 0);			/* Inefficient but so what */
+					rcode = TRUE; break;
+
+				/* Film thickness (may also update tmin/tmax if vary enabled */
+				case IDV_FILM_NM_0:
+				case IDV_FILM_NM_1:
+				case IDV_FILM_NM_2:
+				case IDV_FILM_NM_3:
+				case IDV_FILM_NM_4:
+					if (wNotifyCode == EN_KILLFOCUS) {
+						i = wID-IDV_FILM_NM_0;
+						if ( (rval = GetDlgItemDouble(hdlg, wID)) < 0) rval = 0.0;
+						info->sample.nm[i] = rval;
+						SetDlgItemText(hdlg, IDT_SIGMA_0+i, "");				/* Clear any uncertainty values */
+						if (info->sample.vary[i]) {								/* Possibly update tmin/tmax */
+							lower = info->sample.tmin[i];
+							upper = info->sample.tmax[i];
+							if (lower > rval) lower = 0.0;
+							if (upper < rval || upper > 2.0*rval) upper = max(10.0, 2.0 * rval);
+							info->sample.tmin[i] = lower;
+							info->sample.tmax[i] = upper;
+						}
+						SendMessage(hdlg, WMP_SHOW_SAMPLE_STRUCTURE, 0, 0);			/* Inefficient but so what */
+					}
+					rcode = TRUE; break;
+
+				case IDV_NM_LOW_0:
+				case IDV_NM_LOW_1:
+				case IDV_NM_LOW_2:
+				case IDV_NM_LOW_3:
+				case IDV_NM_LOW_4:
+					if (wNotifyCode == EN_KILLFOCUS) {
+						i = wID-IDV_NM_LOW_0;
+						lower = GetDlgItemDouble(hdlg, wID);
+						if (lower > info->sample.nm[i]) lower = 0.0;
+						info->sample.tmin[i] = lower;
+						SetDlgItemDouble(hdlg, wID,  "%.1f", lower);
+						SendMessage(hdlg, WMP_SHOW_SAMPLE_STRUCTURE, 0, 0);			/* Inefficient but so what */
+					}
+					rcode = TRUE; break;
+
+				case IDV_NM_HIGH_0:
+				case IDV_NM_HIGH_1:
+				case IDV_NM_HIGH_2:
+				case IDV_NM_HIGH_3:
+				case IDV_NM_HIGH_4:
+					if (wNotifyCode == EN_KILLFOCUS) {
+						i = wID-IDV_NM_HIGH_0;
+						upper = GetDlgItemDouble(hdlg, wID);
+						if (upper < info->sample.nm[i]) upper = 2.0*info->sample.nm[i];
+						info->sample.tmax[i] = upper;
+						SetDlgItemDouble(hdlg, wID,  "%.1f", upper);
+						SendMessage(hdlg, WMP_SHOW_SAMPLE_STRUCTURE, 0, 0);			/* Inefficient but so what */
 					}
 					rcode = TRUE; break;
 
 				case IDB_REF_CLEAR:
 					SendMessage(hdlg, WMP_CLEAR_REFERENCE_STACK, 0, 0);
+					rcode = TRUE; break;
+
+				case IDC_REF_SUBSTRATE:
+					if (wNotifyCode == CBN_SELCHANGE) {
+						info->reference.substrate = ComboBoxGetIntValue(hdlg, wID);
+						if (info->reference.substrate <= 0) {							/* Don't allow it to be "none" */
+							MessageBeep(MB_ICONERROR);
+							info->reference.substrate = 1;
+							ComboBoxSetByIntValue(hdlg, wID, info->reference.substrate);
+						}
+					}
+					rcode = TRUE; break;
+
+				case IDC_REF_MIRROR:
+					info->reference.mirror = GetDlgItemCheck(hdlg, wID);
+					SendMessage(hdlg, WMP_SHOW_REFERENCE_STRUCTURE, 0, 0);	/* Inefficient but so what */
+					SendMessage(hdlg, WMP_PROCESS_REFERENCE, 0,0);				/* Rebuild the corrections */
+					SendMessage(hdlg, WMP_UPDATE_RAW_AXIS_SCALES, 0, 0);		/* Does a redraw */
 					rcode = TRUE; break;
 
 				case IDC_REF_MATERIAL_0:
@@ -973,9 +1133,11 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 				case IDC_REF_MATERIAL_4:
 					if (wNotifyCode == CBN_SELCHANGE) {
 						i = wID - IDC_REF_MATERIAL_0;
-						EnableDlgItem(hdlg, IDV_REF_NM_0+i, ComboBoxGetIntValue(hdlg, wID) >= 1);
-						SendMessage(hdlg, WMP_PROCESS_REFERENCE, 0,0);			/* Rebuild the corrections */
-						SendMessage(hdlg, WMP_UPDATE_RAW_AXIS_SCALES, 0, 0);	/* Does a redraw */
+						info->reference.imat[i] = ComboBoxGetIntValue(hdlg, wID);
+						if (info->reference.imat[i] < 0) info->reference.imat[i] = 0;
+						SendMessage(hdlg, WMP_SHOW_REFERENCE_STRUCTURE, 0, 0);	/* Inefficient but so what */
+						SendMessage(hdlg, WMP_PROCESS_REFERENCE, 0,0);				/* Rebuild the corrections */
+						SendMessage(hdlg, WMP_UPDATE_RAW_AXIS_SCALES, 0, 0);		/* Does a redraw */
 					}
 					rcode = TRUE; break;
 
@@ -986,70 +1148,13 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 				case IDV_REF_NM_3:
 				case IDV_REF_NM_4:
 					if (wNotifyCode == EN_KILLFOCUS) {
+						i = wID - IDV_REF_NM_0;
+						if ( (rval = GetDlgItemDouble(hdlg, wID)) < 0) rval = 0.0;
+						info->reference.nm[i] = rval;
+						SendMessage(hdlg, WMP_SHOW_REFERENCE_STRUCTURE, 0,0);	/* Inefficient but so what */
 						SendMessage(hdlg, WMP_PROCESS_REFERENCE, 0,0);			/* Rebuild the corrections */
-						SendMessage(hdlg, WMP_UPDATE_RAW_AXIS_SCALES, 0, 0);	/* Does a redraw */
+						SendMessage(hdlg, WMP_UPDATE_RAW_AXIS_SCALES, 0,0);	/* Does a redraw */
 					}
-					rcode = TRUE; break;
-
-				/* Film thickness (use also to set range if blank) */
-				case IDV_FILM_NM_0:
-				case IDV_FILM_NM_1:
-				case IDV_FILM_NM_2:
-				case IDV_FILM_NM_3:
-				case IDV_FILM_NM_4:
-					i = wID-IDV_FILM_NM_0;
-					if (wNotifyCode == EN_KILLFOCUS) {
-						rval = GetDlgItemDouble(hdlg, wID);
-						if (rval < 0) rval = 0.0;
-						SetDlgItemDouble(hdlg, wID, "%.1f", rval);
-						info->sample.stack[i].nm = rval;
-						if (GetDlgItemCheck(hdlg, IDC_VARY_0+i)) {
-							lower = info->sample.stack[i].lower;
-							upper = info->sample.stack[i].upper;
-							if (lower > rval) lower = 0.0;
-							if (upper < rval || upper > 2.0*rval) upper = max(10.0, 2.0 * rval);
-							SetDlgItemDouble(hdlg, IDV_NM_LOW_0+i,  "%.1f", lower);
-							SetDlgItemDouble(hdlg, IDV_NM_HIGH_0+i, "%.1f", upper);
-							info->sample.stack[i].lower = lower;
-							info->sample.stack[i].upper = upper;
-						}
-					}
-					rcode = TRUE; break;
-
-				case IDV_NM_LOW_0:
-				case IDV_NM_LOW_1:
-				case IDV_NM_LOW_2:
-				case IDV_NM_LOW_3:
-				case IDV_NM_LOW_4:
-					i = wID-IDV_NM_LOW_0;
-					if (wNotifyCode == EN_KILLFOCUS) {
-						double rval, lower;
-						rval  = GetDlgItemDouble(hdlg, IDV_FILM_NM_0+i);
-						lower = GetDlgItemDouble(hdlg, wID);
-						if (lower > rval) lower = 0.0;
-						SetDlgItemDouble(hdlg, wID,  "%.1f", lower);
-						info->sample.stack[i].lower = rval;
-					}
-					rcode = TRUE; break;
-
-				case IDV_NM_HIGH_0:
-				case IDV_NM_HIGH_1:
-				case IDV_NM_HIGH_2:
-				case IDV_NM_HIGH_3:
-				case IDV_NM_HIGH_4:
-					i = wID-IDV_NM_HIGH_0;
-					if (wNotifyCode == EN_KILLFOCUS) {
-						double rval, upper;
-						rval  = GetDlgItemDouble(hdlg, IDV_FILM_NM_0+i);
-						upper = GetDlgItemDouble(hdlg, wID);
-						if (upper < rval) upper = 2.0*rval;
-						SetDlgItemDouble(hdlg, wID,  "%.1f", upper);
-						info->sample.stack[i].upper = rval;
-					}
-					rcode = TRUE; break;
-
-				case IDB_FILM_CLEAR:
-					SendMessage(hdlg, WMP_CLEAR_SAMPLE_STACK, 0, 0);
 					rcode = TRUE; break;
 
 				case IDB_TRY:
@@ -1061,28 +1166,31 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 					do_fit(hdlg, info);													/* go and let it run */
 
 					/* Record values and replot new fit ... then deal with sigma */
-					icnt = 1;																/* alway vary scaling */
+					ilayer = 0;																/* Which layer in the final structure */
+					nvary = 1;																/* # parameters varied (always scaling) */
 					for (i=0; i<N_FILM_STACK; i++) {
-						if (info->sample.stack[i].vary) {
-							SetDlgItemDouble(hdlg, IDV_FILM_NM_0+i, "%.2f", info->sample.stack[i].nm);
-							icnt++;
-						}
+						if (info->sample.imat[i] == 0) continue;					/* A nothing layer (doesn't get to stack */
+						if (info->sample.vary[i]) info->sample.nm[i] = info->sample.stack[ilayer].nm;
+						ilayer++; nvary++;
 					}
 					SetDlgItemDouble(hdlg, IDV_FIT_SCALING, "%.3f", info->fit_parms.scaling);
 					CalcChiSqr(info->lambda, info->cv_refl->y, info->cv_refl->s, info->tfoc_fit, info->npt, info->fit_parms.lambda_min, info->fit_parms.lambda_max, &chisqr, &dof);
-					chisqr = chisqr*dof/max(1,dof-icnt);							/* Correct for # of free parameters */
-					dof -= icnt;
+					chisqr = chisqr*dof/max(1,dof-nvary);							/* Correct for # of free parameters */
+					dof -= nvary;
 					SetDlgItemDouble(hdlg, IDT_CHISQR, "%.3f", sqrt(chisqr));
 					SetDlgItemInt(hdlg, IDT_DOF, dof, TRUE);
 
 					/* Fake the sigma based on chisqr ... too many people would not understand the link with chisqr_\nu */
+					ilayer = 0;
 					for (i=0; i<N_FILM_STACK; i++) {
-						if (info->sample.stack[i].vary) {
-							SetDlgItemDouble(hdlg, IDT_SIGMA_0+i, "%.2f", info->sample.stack[i].sigma*sqrt(chisqr));
-						} else {
-							SetDlgItemText(hdlg, IDT_SIGMA_0+i, "0.0");
+						SetDlgItemText(hdlg, IDT_SIGMA_0+i, "");
+						if (info->sample.imat[i] == 0) continue;					/* Not a real layer */
+						if (info->sample.vary) {
+							SetDlgItemDouble(hdlg, IDT_SIGMA_0+i, "%.2f", info->sample.stack[ilayer].sigma*sqrt(chisqr));
 						}
+						ilayer++;
 					}
+					SendMessage(hdlg, WMP_SHOW_SAMPLE_STRUCTURE, 0, 0);			/* Redraw the sample */
 					SendMessage(hdlg, WMP_UPDATE_MAIN_AXIS_SCALES, 0, 0);			/* Redraw the results */
 					rcode = TRUE; break;
 
@@ -1116,15 +1224,15 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 					if (wNotifyCode == EN_KILLFOCUS) {
 						info->fit_parms.scaling_min = GetDlgItemDouble(hdlg, wID);
 						if (info->fit_parms.scaling_min < 0.5) info->fit_parms.scaling_min = 0.5;
-						SetDlgItemDouble(hdlg, wID, "%.1f", info->fit_parms.scaling_min);
+						SetDlgItemDouble(hdlg, wID, "%.2f", info->fit_parms.scaling_min);
 					}
 					rcode = TRUE; break;
-					
+
 				case IDV_FIT_SCALING_MAX:
 					if (wNotifyCode == EN_KILLFOCUS) {
 						info->fit_parms.scaling_max = GetDlgItemDouble(hdlg, wID);
 						if (info->fit_parms.scaling_max > 2.0) info->fit_parms.scaling_max = 2.0;
-						SetDlgItemDouble(hdlg, wID, "%.1f", info->fit_parms.scaling_max);
+						SetDlgItemDouble(hdlg, wID, "%.2f", info->fit_parms.scaling_max);
 					}
 					rcode = TRUE; break;
 
@@ -1437,22 +1545,20 @@ static int SaveData(FILM_MEASURE_INFO *info, char *path) {
 
 		fprintf(funit, "# REFERENCE STACK\n");
 		for (i=0; i<N_FILM_STACK; i++) {
-			if ( (imat = ComboBoxGetIntValue(hdlg, IDC_REF_MATERIAL_0+i)) <= 0) continue;
-			fprintf(funit, "#    %d \"%s\" %f\n", i, materials[imat].id, GetDlgItemDouble(hdlg, IDV_REF_NM_0+i));
+			if ( (imat = info->reference.imat[i]) <= 0) continue;				/* Nothing there */
+			fprintf(funit, "#    %d \"%s\" %f\n", i, materials[imat].id, info->reference.nm[i]);
 		}
-		imat = ComboBoxGetIntValue(hdlg, IDC_REF_SUBSTRATE);
+		imat = info->reference.substrate;
 		fprintf(funit, "#   substrate \"%s\"\n", materials[imat].id);
 		fprintf(funit, "# END\n");
 
 		fprintf(funit, "# SAMPLE STACK\n");
 		for (i=0; i<N_FILM_STACK; i++) {
-			if ( (imat = ComboBoxGetIntValue(hdlg, IDC_FILM_MATERIAL_0+i)) <= 0) continue;
+			if ( (imat = info->sample.imat[i]) <= 0) continue;				/* Nothing there */
 			fprintf(funit, "#   %d \"%s\" %f %f %f %d\n", i, materials[imat].id, 
-					  GetDlgItemDouble(hdlg, IDV_FILM_NM_0+i), 
-					  GetDlgItemDouble(hdlg, IDV_NM_LOW_0+i), GetDlgItemDouble(hdlg, IDV_NM_HIGH_0+i),
-					  GetDlgItemCheck(hdlg, IDC_VARY_0+i));
+					  info->sample.nm[i], info->sample.tmin[i], info->sample.tmax[i], info->sample.vary[i]);
 		}
-		imat = ComboBoxGetIntValue(hdlg, IDC_FILM_SUBSTRATE);
+		imat = info->sample.substrate;
 		fprintf(funit, "#   substrate \"%s\"\n", materials[imat].id);
 		fprintf(funit, "# END\n");
 
@@ -1470,37 +1576,6 @@ static int SaveData(FILM_MEASURE_INFO *info, char *path) {
 		fclose(funit);
 	}
 	return 0;
-}
-
-/* ===========================================================================
--- Routine to look up a material by name and return the index in the
--- CB_INT_LIST so can be loaded properly
-=========================================================================== */
-int GetMaterialIndex(char *aptr, char **endptr) {
-	int i, cnt;
-	char *bptr, id[200];				/* For the name */
-
-	/* Copy over the string, expecting that it is "enclosed" in quotes */
-	while (isspace(*aptr)) aptr++;
-	if (*aptr == '"') {
-		aptr++;
-		bptr = id; cnt = sizeof(id);
-		while (*aptr && *aptr != '"') {
-			if (--cnt > 0) *(bptr++) = *aptr;
-			aptr++;
-		}
-		if (*aptr == '"') aptr++;
-		*bptr = '\0';
-	}
-	while (isspace(*aptr)) aptr++;
-	if (endptr != NULL) *endptr = aptr;
-	
-	/* Scan through the list of all materials I've loaded */
-	cnt = CB_COUNT(materials);
-	for (i=0; i<cnt; i++) {
-		if (_stricmp(materials[i].id, id) == 0) return i;
-	}
-	return cnt-1;
 }
 
 /* ===========================================================================
@@ -1528,8 +1603,7 @@ static int LoadData(FILM_MEASURE_INFO *info, char *path) {
 
 	static char local_dir[PATH_MAX]="";					/* Directory -- keep for multiple calls */
 
-	int i, ipt, index, npt;
-	BOOL bval;
+	int i, ipt, imat, index, npt;
 	FILE *funit;
 	OPENFILENAME ofn;
 	char *aptr, szBuf[256];
@@ -1625,13 +1699,19 @@ static int LoadData(FILM_MEASURE_INFO *info, char *path) {
 				if (isdigit(*aptr)) {									/* Okay, is a layer definition */
 					index = *(aptr++)-'0';
 					if (index >= 0 && index < N_FILM_STACK) {
-						ComboBoxSetByIntValue(hdlg, IDC_REF_MATERIAL_0+index, GetMaterialIndex(aptr, &aptr));
-						SetDlgItemDouble(hdlg, IDV_REF_NM_0+index, "%.1f", strtod(aptr, &aptr));
-						EnableDlgItem(hdlg, IDC_REF_MATERIAL_0+index, TRUE);
-						EnableDlgItem(hdlg, IDV_REF_NM_0+index, TRUE);
+						if ( (imat = FindMaterialIndex(aptr, &aptr)) < 0) {
+							fprintf(stderr, "Material %s was not found in the list as reference layer %d\n", szBuf, index); fflush(stderr);
+							imat = 1;					/* Take first one */
+						}
+						info->reference.imat[index] = imat;
+						info->reference.nm[index] = strtod(aptr, &aptr);
 					}
 				} else if (_strnicmp(aptr, "substrate ", 10) == 0) {
-					ComboBoxSetByIntValue(hdlg, IDC_REF_SUBSTRATE, GetMaterialIndex(aptr+10, NULL));
+					if ( (imat = FindMaterialIndex(aptr+10, NULL)) < 0) {
+						fprintf(stderr, "Material %s was not found in the list for reference substrate\n", aptr+10); fflush(stderr);
+						imat = 1;					/* Take first one */
+					}
+					info->reference.substrate = imat;
 				}
 
 			} else if (mode == SAMPLE) {
@@ -1640,23 +1720,23 @@ static int LoadData(FILM_MEASURE_INFO *info, char *path) {
 				if (isdigit(*aptr)) {									/* Okay, is a layer definition */
 					index = *(aptr++)-'0';
 					if (index >= 0 && index < N_FILM_STACK) {
-						ComboBoxSetByIntValue(hdlg, IDC_FILM_MATERIAL_0+index, GetMaterialIndex(aptr, &aptr));
-						SetDlgItemDouble(hdlg, IDV_FILM_NM_0+index, "%.1f", strtod(aptr, &aptr));
-						SetDlgItemDouble(hdlg, IDV_NM_LOW_0+index,  "%.1f", strtod(aptr, &aptr));
-						SetDlgItemDouble(hdlg, IDV_NM_HIGH_0+index, "%.1f", strtod(aptr, &aptr));
-						while (isspace(*aptr)) aptr++;
-						bval = strchr("yY1", *aptr) != NULL;
-						SetDlgItemCheck(hdlg, IDC_VARY_0+index, bval);
-						EnableDlgItem(hdlg, IDC_FILM_MATERIAL_0+index, TRUE);
-						EnableDlgItem(hdlg, IDV_FILM_NM_0+index, TRUE);
-						EnableDlgItem(hdlg, IDC_VARY_0+index, TRUE);
-						if (bval) {
-							EnableDlgItem(hdlg, IDV_NM_LOW_0+index, TRUE);
-							EnableDlgItem(hdlg, IDV_NM_HIGH_0+index, TRUE);
+						if ( (imat = FindMaterialIndex(aptr, &aptr)) < 0) {
+							fprintf(stderr, "Material %s was not found in the list as sample layer %d\n", szBuf, index); fflush(stderr);
+							imat = 1;					/* Take first one */
 						}
+						info->sample.imat[index] = imat;
+						info->sample.nm[index]   = strtod(aptr, &aptr);
+						info->sample.tmin[index] = strtod(aptr, &aptr);
+						info->sample.tmax[index] = strtod(aptr, &aptr);
+						while (isspace(*aptr)) aptr++;
+						info->sample.vary[index] = strchr("yY1", *aptr) != NULL;
 					}
 				} else if (_strnicmp(aptr, "substrate ", 10) == 0) {
-					ComboBoxSetByIntValue(hdlg, IDC_REF_SUBSTRATE, GetMaterialIndex(aptr+10, NULL));
+					if ( (imat = FindMaterialIndex(aptr+10, NULL)) < 0) {
+						fprintf(stderr, "Material %s was not found in the list for film substrate\n", aptr+10); fflush(stderr);
+						imat = 1;					/* Take first one */
+					}
+					info->sample.substrate = imat;
 				}
 
 			} else if (*szBuf == '#') {								/* Other comment line */
@@ -1751,6 +1831,9 @@ static int LoadData(FILM_MEASURE_INFO *info, char *path) {
 		free(refl);
 
 		/* All of these curves are now modified in any case */
+		SendMessage(hdlg, WMP_SHOW_SAMPLE_STRUCTURE, 0, 0);
+		SendMessage(hdlg, WMP_SHOW_REFERENCE_STRUCTURE, 0, 0);
+
 		SendMessage(hdlg, WMP_PROCESS_REFERENCE, 0,0);			/* Rebuild the corrections */
 		SendMessage(hdlg, WMP_UPDATE_RAW_AXIS_SCALES, 0, 0);	/* Does a redraw */
 
@@ -1761,6 +1844,272 @@ static int LoadData(FILM_MEASURE_INFO *info, char *path) {
 	return 0;
 }
 
+/* ===========================================================================
+-- Routine to write the parameters on screen to an inifile so reload similar
+--
+-- Usage: int WriteProfileInfo(HWND hdlg, FILM_MEASURE_INFO *info);
+--
+-- Inputs: hdlg - pointer to current dialog box with values in controls
+--         info - pointer to information structure
+--
+-- Output: Writes the file "FilmMeasure.ini" with information
+--
+-- Return: 0 always (no error checking).  Nothing guarentees success.
+--
+-- Notes: Uses WritePrivateProfileStr instead of WritePrivateProfileString
+--        from win32ex.c so could implement readily if the 16-bit support
+--        for simple ini files every disappears
+=========================================================================== */
+static int WriteProfileInfo(HWND hdlg, FILM_MEASURE_INFO *info) {
+	static char *rname = "WriteProfileInfo";
+
+	char szBuf[256], layer[20];
+	int i, imat;
+
+	/* Graph X-axis scaling */
+	sprintf_s(szBuf, sizeof(szBuf), "%g %g", info->lambda_min, info->lambda_max);
+	WritePrivateProfileString("Graph", "Lambda_Range", szBuf, IniFile);
+	WritePrivateProfileInt   ("Graph", "Lambda_Autoscale", info->lambda_autoscale, IniFile);
+
+	/* Fitting parameters */
+	sprintf_s(szBuf, sizeof(szBuf), "%g %g", info->fit_parms.lambda_min, info->fit_parms.lambda_max);
+	WritePrivateProfileStr("Fit", "Lambda_Range", szBuf, IniFile);
+	sprintf_s(szBuf, sizeof(szBuf), "%g %g", info->fit_parms.scaling_min, info->fit_parms.scaling_max);
+	WritePrivateProfileStr("Fit", "Scaling_Range", szBuf, IniFile);
+
+	/* Save the current reference film stack */
+	for (i=0; i<N_FILM_STACK; i++) {
+		sprintf_s(layer, sizeof(layer), "Layer_%d_Material", i);
+		imat = info->reference.imat[i];
+		WritePrivateProfileStr("Reference", layer, materials[imat].id, IniFile);
+		sprintf_s(layer, sizeof(layer), "Layer_%d_Thickness", i);
+		WritePrivateProfileDouble("Reference", layer, info->reference.nm[i], IniFile);
+	}
+	imat = info->reference.substrate;
+	WritePrivateProfileStr("Reference", "Substrate", materials[imat].id, IniFile);
+	WritePrivateProfileInt("Reference", "Mirror", info->reference.mirror, IniFile);
+
+	/* Save the current sample film stack */
+	for (i=0; i<N_FILM_STACK; i++) {
+		sprintf_s(layer, sizeof(layer), "Layer_%d_Material", i);
+		imat = info->sample.imat[i];
+		WritePrivateProfileStr("Film", layer, materials[imat].id, IniFile);
+		sprintf_s(layer, sizeof(layer), "Layer_%d_Thickness", i);
+		WritePrivateProfileDouble("Film", layer, info->sample.nm[i], IniFile);
+		sprintf_s(layer, sizeof(layer), "Layer_%d_Vary", i);
+		WritePrivateProfileInt("Film", layer, info->sample.vary[i], IniFile);
+		sprintf_s(layer, sizeof(layer), "Layer_%d_Limits", i);
+		sprintf_s(szBuf, sizeof(szBuf), "%g %g", info->sample.tmin[i], info->sample.tmax[i]);
+		WritePrivateProfileStr("Film", layer, szBuf, IniFile);
+	}
+	imat = info->sample.substrate;
+	WritePrivateProfileStr("Film", "Substrate", materials[imat].id, IniFile);
+
+	return 0;
+}
+
+/* ===========================================================================
+-- Routine to read initialization parameters from a saved file
+--
+-- Usage: int ReadProfileInfo(HWND hdlg, FILM_MEASURE_INFO *info);
+--
+-- Inputs: hdlg - pointer to current dialog box with values in controls
+--         info - pointer to information structure
+--
+-- Output: Fills in info where appropriate and fills in the substrate
+--            and film structures on the dialog box
+--
+-- Return: 0 always (minimal error checking).
+--
+-- Notes: Using GetPrivateProfileString instead of ReadPrivateProfileStr as
+--        as it permits defining a default string return
+=========================================================================== */
+static int ReadProfileInfo(HWND hdlg, FILM_MEASURE_INFO *info) {
+	static char *rname = "ReadProfileInfo";
+
+	char szBuf[256], layer[20], *aptr;
+	int i, imat;
+	double xmin, xmax;
+
+	/* Graph X-axis scaling */
+	GetPrivateProfileString("Graph", "Lambda_Range", NULL, szBuf, sizeof(szBuf), IniFile);
+	if (*szBuf != '\0') {
+		info->lambda_min = strtod(szBuf, &aptr);
+		info->lambda_max = strtod(aptr, NULL);
+	}
+	GetPrivateProfileString("Graph", "Lambda_Autoscale", NULL, szBuf, sizeof(szBuf), IniFile);
+	if (*szBuf != '\0') info->lambda_autoscale = strtol(szBuf, NULL, 10) != 0;
+
+	/* Fitting parameters */
+	GetPrivateProfileString("Fit", "Lambda_Range", NULL, szBuf, sizeof(szBuf), IniFile);
+	if (*szBuf != '\0') {
+		info->fit_parms.lambda_min = strtod(szBuf, &aptr);
+		info->fit_parms.lambda_max = strtod(aptr, NULL);
+	}
+	GetPrivateProfileString("Fit", "Scaling_Range", NULL, szBuf, sizeof(szBuf), IniFile);
+	if (*szBuf != '\0') {
+		info->fit_parms.scaling_min = strtod(szBuf, &aptr);
+		info->fit_parms.scaling_max = strtod(aptr, NULL);
+	}
+
+	/* Load the reference film stack */
+	for (i=0; i<N_FILM_STACK; i++) {
+		sprintf_s(layer, sizeof(layer), "Layer_%d_Material", i);
+		GetPrivateProfileString("Reference", layer, "none", szBuf, sizeof(szBuf), IniFile);
+		if ( (imat = FindMaterialIndex(szBuf, NULL)) < 0) {
+			fprintf(stderr, "Material %s was not found in the list as reference layer %d\n", szBuf, i); fflush(stderr);
+			imat = 0;					/* Mark as none */
+		}
+		info->reference.imat[i] = imat;
+		sprintf_s(layer, sizeof(layer), "Layer_%d_Thickness", i);
+		GetPrivateProfileString("Reference", layer, "0", szBuf, sizeof(szBuf), IniFile);
+		info->reference.nm[i] = strtod(szBuf, NULL);
+	}
+	GetPrivateProfileString("Reference", "Substrate", "Si", szBuf, sizeof(szBuf), IniFile);
+	if ( (imat = FindMaterialIndex(szBuf, NULL)) <= 0) {
+		fprintf(stderr, "Material %s was not found in the list as a valid reference substrate\n", szBuf); fflush(stderr);
+		imat = 1;					/* Mark as none */
+	}
+	info->reference.substrate = imat;
+
+	/* Load the sample film stack */
+	for (i=0; i<N_FILM_STACK; i++) {
+		sprintf_s(layer, sizeof(layer), "Layer_%d_Material", i);
+		GetPrivateProfileString("Film", layer, "none", szBuf, sizeof(szBuf), IniFile);
+		if ( (imat = FindMaterialIndex(szBuf, NULL)) < 0) {
+			fprintf(stderr, "Material %s was not found in the list as sample layer %d\n", szBuf, i); fflush(stderr);
+			imat = 0;					/* Mark as none */
+		}
+		info->sample.imat[i] = imat;
+		sprintf_s(layer, sizeof(layer), "Layer_%d_Thickness", i);
+		GetPrivateProfileString("Film", layer, "0", szBuf, sizeof(szBuf), IniFile);
+		info->sample.nm[i] = strtod(szBuf, NULL);
+		sprintf_s(layer, sizeof(layer), "Layer_%d_Vary", i);
+		GetPrivateProfileString("Film", layer, "0", szBuf, sizeof(szBuf), IniFile);
+		info->sample.vary[i] = strtol(szBuf, NULL, 10) != 0;
+		sprintf_s(layer, sizeof(layer), "Layer_%d_Limits", i);
+		GetPrivateProfileString("Film", layer, "0", szBuf, sizeof(szBuf), IniFile);
+		xmin = fabs(strtod(szBuf, &aptr));
+		xmax = fabs(strtod(aptr, NULL));
+		if (xmax < xmin) xmax = (xmin == 0) ? 100 : 2*xmin;
+		info->sample.tmin[i] = xmin;
+		info->sample.tmax[i] = xmax;
+	}
+	GetPrivateProfileString("Film", "Substrate", "Si", szBuf, sizeof(szBuf), IniFile);
+	if ( (imat = FindMaterialIndex(szBuf, NULL)) <= 0) {
+		fprintf(stderr, "Material %s was not found in the list as a valid sample substrate\n", szBuf); fflush(stderr);
+		imat = 1;					/* Mark as none */
+	}
+	info->sample.substrate = imat;
+
+	return 0;
+}
+
+/* ===========================================================================
+-- Routine to scan the database directory and create list of known materials
+--
+-- Usage: int = InitMateiralsList();
+--
+-- Inputs: none
+--
+-- Output: Creates the static global materials[] structure 
+--
+-- Return: Number of entries, or <0 on error
+=========================================================================== */
+static int InitMaterialsList(void) {
+	char *database;
+	char pattern[PATH_MAX+1];
+	char path[PATH_MAX+1];
+	intptr_t hdir;								/* Directory handle */
+	struct _finddatai64_t findbuf;		/* Information from FindFirst		*/
+
+	database = Find_TFOC_Database(NULL, 0, NULL);
+	fprintf(stderr, "Using database: \"%s\"\n", database); fflush(stderr);
+
+	if (_fullpath(path, database, sizeof(path)) == NULL) {
+		fprintf(stderr, "Directory does not exist\n"); fflush(stderr);
+		return -1;
+	}
+
+	_makepath_s(pattern, sizeof(pattern), NULL, path, "*", "*");		/* Match all entries in the directory */
+
+	hdir = _findfirst64(pattern, &findbuf);
+	if (hdir < 0) {
+		fprintf(stderr, "hdir returns %d  (pattern=%s)\n", hdir, pattern); fflush(stderr);
+		return -1;							/* Either an error (including no entries) */
+	}
+
+	materials_cnt = 0;												/* Nothing yet */
+	if (materials_cnt >= materials_dim) {
+		materials_dim += 100;
+		materials = realloc(materials, materials_dim * sizeof(*materials));
+	}
+	materials[materials_cnt].id = "none"; 	materials[materials_cnt++].value = 0;		/* Always the first one */
+
+	/* List all names */
+	do {
+		if (findbuf.attrib & _A_SUBDIR) continue;					/* Ignore directories */
+		if (strchr(findbuf.name, '.') != NULL) continue;		/* Ignore anythning with an extension */
+		if (materials_cnt >= materials_dim) {
+			materials_dim += 100;
+			materials = realloc(materials, materials_dim * sizeof(*materials));
+		}
+		materials[materials_cnt].id = _strdup(findbuf.name); materials[materials_cnt].value = materials_cnt;	/* Always the first one */
+		materials_cnt++;
+	} while (_findnext64(hdir, &findbuf) == 0);
+	_findclose(hdir);
+
+	return materials_cnt;
+}
+
+/* ===========================================================================
+-- Routine to look up a material by name and return the index in the
+-- CB_INT_LIST so can be loaded properly
+--
+-- Usage: int FindMaterialIndex(char *text, char **endptr);
+--
+-- Inputs: text   - pointer to a string containing a material name, 
+--                  potentially in quotes
+--         endptr - optional pointer to receive next unused character in string
+--
+-- Output: *endptr - if not NULL, set to next non-whitespace character
+--                   in text string
+--
+-- Return: Index into the database for the string.  -1 if string not found
+=========================================================================== */
+static int FindMaterialIndex(char *text, char **endptr) {
+	int i, cnt;
+	char *bptr, id[200];				/* For the name */
+
+	/* Copy over the string, expecting that it is "enclosed" in quotes */
+	while (isspace(*text)) text++;
+	bptr = id; cnt = sizeof(id);
+	if (*text == '"') {
+		text++;
+		while (*text && *text != '"') {
+			if (--cnt > 0) *(bptr++) = *text;
+			text++;
+		}
+		if (*text == '"') text++;
+	} else {
+		while (*text && ! isspace(*text)) {
+			if (--cnt > 0) *(bptr++) = *text;
+			text++;
+		}
+	}
+	*bptr = '\0';
+
+	while (isspace(*text)) text++;
+	if (endptr != NULL) *endptr = text;
+
+	/* Scan through the list of all materials I've loaded */
+	for (i=0; i<materials_cnt; i++) {
+		if (_stricmp(materials[i].id, id) == 0) return i;
+	}
+
+	return -1;							/* Default failure -- you figure out what to do */
+}
+
 /*
  * ===========================================================================
  * ===========================================================================
@@ -1769,7 +2118,58 @@ static int LoadData(FILM_MEASURE_INFO *info, char *path) {
  * ===========================================================================
  * =========================================================================== */
 
-#define	DATABASE	(NULL)
+
+/* ===========================================================================
+	-- Routine to find the directory containing the TFOC database of material
+	--
+	-- Usage: char *Find_TFOC_Database(char *database, size_t len, int *ierr);
+	--
+	-- Inputs: database - if !NULL, pointer to location to be filled with directory
+	--         len      - size of database (if !NULL)
+	--         ierr     - if !NULL, receives error code
+	--
+	-- Output: *database - if !NULL, contains filled in database directory
+	--         *ierr     - if !NULL, filled with error code (see below)
+	--
+	-- Return: NULL on error, otherwise either database (if !NULL) or pointer
+	--         to an allocated memory with name (caller responsible to free)
+	=========================================================================== */
+static char *Find_TFOC_Database(char *database, size_t len, int *ierr) {
+
+	char *path;
+	size_t cnt;
+	char env_name[PATH_MAX];			/* May be returned as pointer */
+	struct _stat info;
+
+	/* Set ierr and database to default values (assuming success) */
+	if (ierr != NULL) *ierr = 0;
+	if (database != NULL) *database = '\0';
+
+	/* Figure out which database to use ... but only first time */
+	if (getenv_s(&cnt, env_name, sizeof(env_name), "tfocDatabase") == 0 && cnt > 0) {	/* Ignore if required size would be more than PATH_MAX */
+		path = env_name;
+	} else if ( _stat("./tfocDatabase", &info) == 0 && info.st_mode & S_IFDIR ) {
+		path = "./tfocDatabase/";
+	} else if ( _stat("./database.nk", &info) == 0 && info.st_mode & S_IFDIR ) {
+		path = "./database.nk/";
+	} else if ( _stat("c:/tfocDatabase", &info) == 0 && info.st_mode & S_IFDIR ) {
+		path = "c:/tfocDatabase/";
+	} else if ( _stat("c:/database.nk", &info) == 0 && info.st_mode & S_IFDIR ) {		/* Compatibility with earlier versions */
+		path = "c:/database.nk/";
+	} else {																									/* Better hope materials are in the same directory */
+		if (ierr != NULL) *ierr = 1;
+		return NULL;
+	}
+
+	/* Either allocate space or just fill in and return the given buffer */
+	if (database == NULL) {
+		database = _strdup(path);
+	} else {
+		strcpy_s(database, len, path);
+	}
+
+	return database;
+}
 
 /* ===========================================================================
 -- Routine to determine the reflectance of the sample structure under
@@ -1791,26 +2191,10 @@ int AddSimpleLayer(TFOC_SAMPLE **psample, char *material, double nm) {
 
 	TFOC_SAMPLE *sample;
 	int i,j,rc;
+	static char *database=NULL;
 
-	static char *database=NULL;				/* Where material information located */
-
-	/* Figure out which database to use ... but only first time */
-	if (database == NULL) {
-		size_t cnt;
-		char env_name[PATH_MAX];
-		struct _stat info;
-		if (getenv_s(&cnt, env_name, sizeof(env_name), "tfocDatabase") == 0 && cnt > 0) {	/* Ignore if required size would be more than PATH_MAX */
-			database = env_name;
-		} else if ( _stat("./tfocDatabase", &info) == 0 && info.st_mode & S_IFDIR ) {
-			database = "./tfocDatabase/";
-		} else if ( _stat("c:/tfocDatabase", &info) == 0 && info.st_mode & S_IFDIR ) {
-			database = "c:/tfocDatabase/";
-		} else if ( _stat("c:/database.nk", &info) == 0 && info.st_mode & S_IFDIR ) {		/* Compatibility with earlier versions */
-			database = "c:/database.nk/";
-		} else {																									/* Better hope materials are in the same directory */
-			database = "./";
-		}
-	}
+	/* Make sure we have a database */
+	if (database == NULL) database = Find_TFOC_Database(NULL, 0, NULL);
 
 	/* Work with the actual sample, not pointer */
 	sample = *psample;

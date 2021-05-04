@@ -205,7 +205,7 @@ BOOL WritePrivateProfileInt(LPCTSTR lpAppName, LPCTSTR lpKeyName, int ival, LPCT
 
 BOOL WritePrivateProfileDouble(LPCTSTR lpAppName, LPCTSTR lpKeyName, double rval, LPCTSTR lpFileName) {
 	char buf[80];
-	sprintf_s(buf, sizeof(buf), "%f", rval);
+	sprintf_s(buf, sizeof(buf), "%g", rval);
 	return WritePrivateProfileString(lpAppName, lpKeyName, buf, lpFileName);
 }
 
