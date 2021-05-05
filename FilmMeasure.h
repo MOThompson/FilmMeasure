@@ -44,6 +44,7 @@ typedef struct _FILM_MEASURE_INFO {
 	} reference;
 
 	struct {
+		double scaling;							/* Multiplicative scaling of raw REFL data */
 		int imat[N_FILM_STACK], substrate;	/* Index of the film layers and substrate */
 		double nm[N_FILM_STACK],				/* Thickness of each layer */
 				 tmin[N_FILM_STACK],				/* Minimum thickness allowed in fit */
@@ -57,7 +58,6 @@ typedef struct _FILM_MEASURE_INFO {
 	struct {
 		double lambda_min, lambda_max;		/* X range (wavelength) for fitting */
 		double scaling_min, scaling_max;		/* Scaling min/max (multiplicative) */
-		double scaling;							/* Multiplicative scaling for fit */
 	} fit_parms;
 
 } FILM_MEASURE_INFO;
@@ -71,15 +71,17 @@ typedef struct _FILM_MEASURE_INFO {
 #define	WMP_UPDATE_MAIN_AXIS_SCALES	(WM_APP+6)
 
 #define	WMP_PROCESS_REFERENCE			(WM_APP+7)
-#define	WMP_PROCESS_MEASUREMENT			(WM_APP+8)
+#define	WMP_RECALC_RAW_REFLECTANCE		(WM_APP+8)
+#define	WMP_PROCESS_MEASUREMENT			(WM_APP+9)
+#define	WMP_REFINE_FIT						(WM_APP+10)
 
-#define	WMP_CLEAR_SAMPLE_STACK			(WM_APP+9)
-#define	WMP_SHOW_SAMPLE_STRUCTURE		(WM_APP+10)
-#define	WMP_MAKE_SAMPLE_STACK			(WM_APP+11)
+#define	WMP_CLEAR_SAMPLE_STACK			(WM_APP+11)
+#define	WMP_SHOW_SAMPLE_STRUCTURE		(WM_APP+12)
+#define	WMP_MAKE_SAMPLE_STACK			(WM_APP+13)
 
-#define	WMP_CLEAR_REFERENCE_STACK		(WM_APP+12)
-#define	WMP_SHOW_REFERENCE_STRUCTURE	(WM_APP+13)
-#define	WMP_MAKE_REFERENCE_STACK		(WM_APP+14)
+#define	WMP_CLEAR_REFERENCE_STACK		(WM_APP+14)
+#define	WMP_SHOW_REFERENCE_STRUCTURE	(WM_APP+15)
+#define	WMP_MAKE_REFERENCE_STACK		(WM_APP+16)
 
 #define	ID_NULL			(-1)
 

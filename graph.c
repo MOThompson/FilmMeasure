@@ -815,7 +815,7 @@ LRESULT CALLBACK GraphWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 						}
 						if (cv->s != NULL && graph->mode == GR_LINEAR) {
 							idy = (int) (cv->s[i]/(ymax-ymin)*graph->cyClient+0.5);
-							if (idy > 2) {
+							if (idy > 0) {
 								MoveToEx(hdc, ix, iy+idy, (LPPOINT) NULL);
 								LineTo(hdc, ix, iy-idy);
 							}

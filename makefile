@@ -44,7 +44,7 @@ FilmMeasure.exe : $(OBJS)
 	$(CC) -FeFilmMeasure.exe $(CFLAGS) $(OBJS) $(LIBS) $(SYSLIBS) /link  /NODEFAULTLIB:LIBCMT
 
 test.exe : test.obj spec_client.obj server_support.obj 
-	$(CC) -Fetest.exe $(CFLAGS) $(OBJS) $(SYSLIBS)
+	$(CC) -Fetest.exe $(CFLAGS) test.obj spec_client.obj server_support.obj $(SYSLIBS)
 
 .c.obj:
 	$(CC) $(CFLAGS) -c -Fo$@ $<
@@ -76,6 +76,12 @@ server_support.c : \code\lab\Server_Support\server_support.c
 	copy $** $@
 
 server_support.h : \code\lab\Server_Support\server_support.h
+	copy $** $@
+
+spec.h : ..\spec\spec.h
+	copy $** $@
+
+spec_client.h : ..\spec\spec_client.h
 	copy $** $@
 
 # ---------------------------------------------------------------------------

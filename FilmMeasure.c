@@ -9,6 +9,10 @@
 
 #define	SPEC_CLIENT_IP			LOOPBACK_SERVER_IP_ADDRESS
 
+#define	ERROR_BEEP_FREQ	(880)
+#define	ERROR_BEEP_MS		(300)
+
+
 /* ------------------------------ */
 /* Standard include files         */
 /* ------------------------------ */
@@ -90,9 +94,11 @@ static int FindMaterialIndex(char *text, char **endptr);
 
 static int CalcChiSqr(double *x, double *y, double *s, double *yfit, int npt, double xmin, double xmax, double *pchisqr, int *pdof);
 static int do_fit(HWND hdlg, FILM_MEASURE_INFO *info);
+
+static int QueryLogfile(HWND hdlg, int wID);
+static int QueryAutofile(HWND hdlg);
 static int SaveData(FILM_MEASURE_INFO *info, char *fname);
 static int LoadData(FILM_MEASURE_INFO *info, char *path);
-
 static int WriteProfileInfo(HWND hdlg, FILM_MEASURE_INFO *info);
 static int ReadProfileInfo(HWND hdlg, FILM_MEASURE_INFO *info);
 
@@ -167,14 +173,14 @@ int WINAPI WinMain(HINSTANCE hThisInst, HINSTANCE hPrevInst, LPSTR lpszArgs, int
 --
 -- Return: return code, generally BOOL
 =========================================================================== */
-#define	TIMER_SPEC_UPDATE			(3)
+#define	TIMER_AUTO_MEASURE			(3)
 
 INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) {
 	static char *rname = "MainDlgProc";
 
 	BOOL rcode, enable;
 	int wID, wNotifyCode;
-	int i, nvary, ilayer, rc;
+	int i, ms, nvary, ilayer, rc;
 	char szBuf[256];
 
 	FILM_LAYERS *stack;
@@ -210,7 +216,8 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 		IDV_FIT_LAMBDA_MIN, IDV_FIT_LAMBDA_MAX, 
 		IDV_FIT_SCALING, IDV_FIT_SCALING_MIN, IDV_FIT_SCALING_MAX, 
 		IDV_GRAPH_LAMBDA_MAX, IDV_GRAPH_LAMBDA_MIN, 
-		IDV_SPEC_IP, 
+		IDV_SPEC_IP, IDV_MEASURE_DELAY, IDV_LOGFILE,
+		IDV_AUTOFILE_DIR, IDV_AUTOFILE_FILE, IDV_AUTOFILE_NUM,
 		ID_NULL };
 
 	HWND hwndTest;
@@ -265,7 +272,7 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 				info->fit_parms.lambda_max  = 800.0;
 				info->fit_parms.scaling_min = 0.95;
 				info->fit_parms.scaling_max = 1.05;
-				info->fit_parms.scaling     = 1.0;
+				info->sample.scaling        = 1.0;
 				info->reference.substrate = FindMaterialIndex("c-Si", NULL);
 				if (info->reference.substrate <= 0) info->reference.substrate = 1;
 				info->sample.substrate = FindMaterialIndex("c-Si", NULL);
@@ -318,12 +325,14 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 			/* Filling parameters */
 			SetDlgItemDouble(hdlg, IDV_FIT_LAMBDA_MIN,  "%.1f", info->fit_parms.lambda_min);
 			SetDlgItemDouble(hdlg, IDV_FIT_LAMBDA_MAX,  "%.1f", info->fit_parms.lambda_max);
-			SetDlgItemDouble(hdlg, IDV_FIT_SCALING,     "%.3f", info->fit_parms.scaling);
 			SetDlgItemDouble(hdlg, IDV_FIT_SCALING_MIN, "%.2f", info->fit_parms.scaling_min);
 			SetDlgItemDouble(hdlg, IDV_FIT_SCALING_MAX, "%.2f", info->fit_parms.scaling_max);
 
-			/* Start the timers */
-			SetTimer(hdlg, TIMER_SPEC_UPDATE, 1000, NULL);					/* Update spectrometer parameters seconds (if live) */
+			SetDlgItemInt(hdlg, IDV_MEASURE_DELAY, 1, FALSE);
+			SetDlgItemText(hdlg, IDV_AUTOFILE_DIR, ".");
+			SetDlgItemText(hdlg, IDV_AUTOFILE_FILE, "scan");
+			SetDlgItemText(hdlg, IDV_AUTOFILE_NUM, "0000");
+
 			rcode = TRUE; break;
 
 		case WM_CLOSE:
@@ -346,10 +355,8 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 			rcode = TRUE; break;
 
 		case WM_TIMER:
-			if (wParam == TIMER_SPEC_UPDATE) {
-				/* Query spectrometer integration parameters */
-				if (info->spec_ok) {
-				}
+			if (wParam == TIMER_AUTO_MEASURE) {
+				if (info->spec_ok) SendMessage(hdlg, WM_COMMAND, MAKEWPARAM(IDB_MEASURE, BN_CLICKED), (LPARAM) hdlg);
 			}
 			rcode = TRUE; break;
 
@@ -396,19 +403,27 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 
 		/* Called only by CONNECT button */
 		case WMP_OPEN_SPEC:
-			if (info->spec_ok) { Shutdown_Spec_Client(); info->spec_ok = FALSE; }
-			info->spec_ok = Init_Spec_Client(info->spec_IP) == 0;
-			if (! info->spec_ok) {
-				MessageBox(hdlg, "Unable to open", "SPEC connect failure", MB_ICONERROR | MB_OK);
-			} else {
+			if (info->spec_ok) Shutdown_Spec_Client();	/* Close down cleanly */
+			info->spec_ok = FALSE;								/* Definitely no longer connected */
+			rc = Init_Spec_Client(info->spec_IP);
+			if (rc == 0) {											/* Success - only need to verify versions */
 				int client_version, server_version;
-
 				client_version = Spec_Remote_Query_Client_Version();
 				server_version = Spec_Remote_Query_Server_Version();
-				if (client_version != server_version) {
+				info->spec_ok = (client_version == server_version);
+				if (! info->spec_ok) {
 					MessageBox(hdlg, "ERROR: Version mismatch between client and server.  Have to abort", "SPEC connect failure", MB_ICONERROR | MB_OK);
-					Shutdown_Spec_Client();	info->spec_ok = FALSE;
+					Shutdown_Spec_Client();
 				}
+			} else if (rc == 1) {
+				MessageBox(hdlg, "Unable to open the socket.  Verify the SPEC server is running.", "SPEC connect failure", MB_ICONERROR | MB_OK);
+			} else if (rc == 2) {
+				MessageBox(hdlg, "Unable to query server version from the SPEC server.  Unknown reason.", "SPEC connect failure", MB_ICONERROR | MB_OK);
+			} else if (rc == 3) {
+				MessageBox(hdlg, "Mismatch between server and client versions for the SPEC connection.", "SPEC connect failure", MB_ICONERROR | MB_OK);
+			} else {
+				sprintf_s(szBuf, sizeof(szBuf), "Unable to open SPEC server.  Unknown return code (rc=%d)", rc);
+				MessageBox(hdlg, szBuf, "SPEC connect failure", MB_ICONERROR | MB_OK);
 			}
 			rcode = TRUE; break;
 
@@ -641,6 +656,7 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 				info->sample.vary[i] = FALSE;
 				SetDlgItemText(hdlg, IDT_SIGMA_0+i, "");						/* Clear sigma */
 			}
+			info->sample.scaling = 1.0;
 			SendMessage(hdlg, WMP_SHOW_SAMPLE_STRUCTURE, 0, 0);
 			rcode = TRUE; break;
 
@@ -663,6 +679,7 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 				EnableDlgItem(hdlg, IDV_NM_HIGH_0+i, info->sample.vary[i]);
 			}
 			ComboBoxSetByIntValue(hdlg, IDC_FILM_SUBSTRATE, info->sample.substrate);
+			SetDlgItemDouble(hdlg, IDV_FIT_SCALING, "%.3f", info->sample.scaling);
 			rcode = TRUE; break;
 
 		case WMP_MAKE_SAMPLE_STACK:
@@ -726,7 +743,7 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 			}
 			rcode = TRUE; break;
 
-		case WMP_PROCESS_MEASUREMENT:
+		case WMP_RECALC_RAW_REFLECTANCE:
 			if (info->cv_raw != NULL && info->cv_ref != NULL) {			/* Don't have to have dark */
 				double *raw, *dark, *ref;
 
@@ -740,17 +757,30 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 					} else {
 						cv->y[i] = raw[i] / max(1.0,ref[i]) ;
 					}
-					cv->s[i] = sqrt(1.0/max(1.0,raw[i]) + 1.0/max(1.0,ref[i]));		/* Fractional uncertainty */
+					cv->s[i] = sqrt(1.0/max(1.0,raw[i]) + 1.0/max(1.0,ref[i]));		/* Fractional uncertainty (unbiased by scaling) */
 					cv->y[i] = max(-1.0, min(2.0, cv->y[i]));
 					if (info->tfoc_reference != NULL) cv->y[i] *= info->tfoc_reference[i];
 					cv->s[i] = cv->s[i] * cv->y[i];								/* Been calculating fractional relative error */
+				}
+				cv->modified = TRUE;
+			}
+			rcode = TRUE; break;
+
+
+		case WMP_PROCESS_MEASUREMENT:
+			SendMessage(hdlg, WMP_RECALC_RAW_REFLECTANCE, 0, 0);			/* Do all but scaling factor */
+			if (info->cv_refl != NULL) {											/* Scale correction - only when displayed, not fit */
+				cv = info->cv_refl;
+				for (i=0; i<cv->npt; i++) {										/* Calculate the normalized reflectance */
+					cv->y[i] *= info->sample.scaling;							/* Scale up/down for small intensity errors */
+					cv->s[i] *= info->sample.scaling;
 				}
 				cv->modified = TRUE;
 
 				/* Read the current parameters to create a "fit stack" and generate reflectance curve */
 				SendMessage(hdlg, WMP_MAKE_SAMPLE_STACK, 0, 0);
 				info->tfoc_fit = realloc(info->tfoc_fit, info->npt * sizeof(*info->tfoc_fit));
-				TFOC_GetReflData(info->sample.tfoc, info->fit_parms.scaling, 0.0, UNPOLARIZED, 300.0, info->npt, info->lambda, info->tfoc_fit);
+				TFOC_GetReflData(info->sample.tfoc, 1.0, 0.0, UNPOLARIZED, 300.0, info->npt, info->lambda, info->tfoc_fit);
 
 				/* Create the curve with the fit for display */
 				cv = info->cv_fit = ReallocReflCurve(hdlg, info, info->cv_fit, info->npt, 4, "fit", colors[4]);
@@ -779,7 +809,41 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 				
 				SendMessage(hdlg, WMP_UPDATE_MAIN_AXIS_SCALES, 0, 0);		/* Does a redraw */
 			}
-				rcode = TRUE; break;
+			rcode = TRUE; break;
+
+		case WMP_REFINE_FIT:
+			SendMessage(hdlg, WMP_MAKE_SAMPLE_STACK, 0, 0);				/* Has all data for moment */
+			SendMessage(hdlg, WMP_RECALC_RAW_REFLECTANCE, 0, 0);		/* Raw ignores "scaling" correction (processed differently in fit) */
+			do_fit(hdlg, info);													/* go and let it run */
+
+			/* Record values and replot new fit ... then deal with sigma */
+			ilayer = 0;																/* Which layer in the final structure */
+			nvary = 1;																/* # parameters varied (always scaling) */
+			for (i=0; i<N_FILM_STACK; i++) {
+				if (info->sample.imat[i] == 0) continue;					/* A nothing layer (doesn't get to stack */
+				if (info->sample.vary[i]) info->sample.nm[i] = info->sample.stack[ilayer].nm;
+				ilayer++; nvary++;
+			}
+			CalcChiSqr(info->lambda, info->cv_refl->y, info->cv_refl->s, info->tfoc_fit, info->npt, info->fit_parms.lambda_min, info->fit_parms.lambda_max, &chisqr, &dof);
+			chisqr = chisqr*dof/max(1,dof-nvary);							/* Correct for # of free parameters */
+			dof -= nvary;
+			SetDlgItemDouble(hdlg, IDT_CHISQR, "%.3f", sqrt(chisqr));
+			SetDlgItemInt(hdlg, IDT_DOF, dof, TRUE);
+
+			/* Fake the sigma based on chisqr ... too many people would not understand the link with chisqr_\nu */
+			ilayer = 0;
+			for (i=0; i<N_FILM_STACK; i++) {
+				SetDlgItemText(hdlg, IDT_SIGMA_0+i, "");
+				if (info->sample.imat[i] == 0) continue;					/* Not a real layer */
+				if (info->sample.vary) {
+					SetDlgItemDouble(hdlg, IDT_SIGMA_0+i, "%.2f", info->sample.stack[ilayer].sigma*sqrt(chisqr));
+				}
+				ilayer++;
+			}
+			SendMessage(hdlg, WMP_SHOW_SAMPLE_STRUCTURE, 0, 0);		/* Redraw the sample */
+			SendMessage(hdlg, WMP_PROCESS_MEASUREMENT, 0,0);			/* Recalculate and draw (critical to handle scaling) */
+			SendMessage(hdlg, WMP_UPDATE_MAIN_AXIS_SCALES, 0, 0);		/* Redraw the results */
+			rcode = TRUE; break;
 
 		case WM_COMMAND:
 			wID = LOWORD(wParam);									/* Control sending message	*/
@@ -844,16 +908,18 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 					rcode = TRUE; break;
 
 				case IDB_INITIALIZE_SPEC:
-					if (info->spec_ok) {
-						Shutdown_Spec_Client();	info->spec_ok = FALSE;
-					} else {
-						SendMessage(hdlg, WMP_OPEN_SPEC, 0, 0);
+					if (wNotifyCode == BN_CLICKED) {
+						if (info->spec_ok) {
+							Shutdown_Spec_Client();	info->spec_ok = FALSE;
+						} else {
+							SendMessage(hdlg, WMP_OPEN_SPEC, 0, 0);
+						}
+						SendMessage(hdlg, WMP_LOAD_SPEC_PARMS, 0, 0);	/* Enables/disables controls */
 					}
-					SendMessage(hdlg, WMP_LOAD_SPEC_PARMS, 0, 0);	/* Enables/disables controls */
 					rcode = TRUE; break;
 
 				case IDB_SPEC_PARMS_UPDATE:
-					SendMessage(hdlg, WMP_UPDATE_SPEC_PARMS, 0, 0);
+					if (wNotifyCode == BN_CLICKED) SendMessage(hdlg, WMP_UPDATE_SPEC_PARMS, 0, 0);
 					rcode = TRUE; break;
 					
 				case IDC_AUTORANGE_WAVELENGTH:
@@ -882,73 +948,111 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 						
 				case IDB_COLLECT_REFERENCE:
 				case IDB_TAKE_REFERENCE:
-					if (! info->lambda_transferred) SendMessage(hdlg, WMP_LOAD_SPEC_WAVELENGTHS, 0, 0);
-					if (wID == IDB_COLLECT_REFERENCE) {
-						rc = Acquire_Raw_Spectrum(hdlg, info, &spectrum_info, &data);
-						npt = info->npt;
-					} else {
-						rc = Spec_Remote_Grab_Saved(SPEC_SPECTRUM_REFERENCE, &data, &npt);
-					}
-					if (rc != 0) {
-						MessageBeep(MB_ICONERROR);
-					} else {
-						cv = info->cv_ref = ReallocRawCurve(hdlg, info, info->cv_ref, npt, 2, "reference", colors[2]);
-						for (i=0; i<npt; i++) cv->y[i] = data[i];
-						cv->modified = TRUE;
-						free(data);
-						SetDlgItemCheck(hdlg, IDC_SHOW_REF, TRUE);
-						EnableDlgItem  (hdlg, IDC_SHOW_REF, TRUE);
+					if (wNotifyCode == BN_CLICKED) {
+						if (! info->lambda_transferred) SendMessage(hdlg, WMP_LOAD_SPEC_WAVELENGTHS, 0, 0);
+						if (wID == IDB_COLLECT_REFERENCE) {
+							rc = Acquire_Raw_Spectrum(hdlg, info, &spectrum_info, &data);
+							npt = info->npt;
+						} else {
+							rc = Spec_Remote_Grab_Saved(SPEC_SPECTRUM_REFERENCE, &data, &npt);
+						}
+						if (rc != 0) {
+							Beep(ERROR_BEEP_FREQ, ERROR_BEEP_MS);
+						} else {
+							cv = info->cv_ref = ReallocRawCurve(hdlg, info, info->cv_ref, npt, 2, "reference", colors[2]);
+							for (i=0; i<npt; i++) cv->y[i] = data[i];
+							cv->modified = TRUE;
+							free(data);
+							SetDlgItemCheck(hdlg, IDC_SHOW_REF, TRUE);
+							EnableDlgItem  (hdlg, IDC_SHOW_REF, TRUE);
 
-						SendMessage(hdlg, WMP_PROCESS_REFERENCE, 0, 0);
-						SendMessage(hdlg, WMP_UPDATE_RAW_AXIS_SCALES, 0, 0);		/* Does a redraw */
+							SendMessage(hdlg, WMP_PROCESS_REFERENCE, 0, 0);
+							SendMessage(hdlg, WMP_UPDATE_RAW_AXIS_SCALES, 0, 0);		/* Does a redraw */
+						}
 					}
 					rcode = TRUE; break;
 
 				case IDB_COLLECT_DARK:
 				case IDB_TAKE_DARK:
-					if (! info->lambda_transferred) SendMessage(hdlg, WMP_LOAD_SPEC_WAVELENGTHS, 0, 0);
-					if (wID == IDB_COLLECT_DARK) {
-						rc = Acquire_Raw_Spectrum(hdlg, info, &spectrum_info, &data);
-						npt = info->npt;
-					} else {
-						rc = Spec_Remote_Grab_Saved(SPEC_SPECTRUM_DARK, &data, &npt);
-					}
-					if (rc != 0) {
-						MessageBeep(MB_ICONERROR);
-					} else {
-						cv = info->cv_dark = ReallocRawCurve(hdlg, info, info->cv_dark, npt, 1, "dark", colors[1]);
-						for (i=0; i<npt; i++) cv->y[i] = data[i];
-						cv->modified = TRUE;
-						free(data);
-						SetDlgItemCheck(hdlg, IDC_SHOW_DARK, TRUE);
-						EnableDlgItem  (hdlg, IDC_SHOW_DARK, TRUE);
+					if (wNotifyCode == BN_CLICKED) {
+						if (! info->lambda_transferred) SendMessage(hdlg, WMP_LOAD_SPEC_WAVELENGTHS, 0, 0);
+						if (wID == IDB_COLLECT_DARK) {
+							rc = Acquire_Raw_Spectrum(hdlg, info, &spectrum_info, &data);
+							npt = info->npt;
+						} else {
+							rc = Spec_Remote_Grab_Saved(SPEC_SPECTRUM_DARK, &data, &npt);
+						}
+						if (rc != 0) {
+							Beep(ERROR_BEEP_FREQ, ERROR_BEEP_MS);
+						} else {
+							cv = info->cv_dark = ReallocRawCurve(hdlg, info, info->cv_dark, npt, 1, "dark", colors[1]);
+							for (i=0; i<npt; i++) cv->y[i] = data[i];
+							cv->modified = TRUE;
+							free(data);
+							SetDlgItemCheck(hdlg, IDC_SHOW_DARK, TRUE);
+							EnableDlgItem  (hdlg, IDC_SHOW_DARK, TRUE);
 
-						SendMessage(hdlg, WMP_UPDATE_RAW_AXIS_SCALES, 0, 0);		/* Does a redraw */
+							SendMessage(hdlg, WMP_UPDATE_RAW_AXIS_SCALES, 0, 0);		/* Does a redraw */
+						}
 					}
 					rcode = TRUE; break;
 
 				case IDB_MEASURE:
 				case IDB_MEASURE_RAW:
 				case IDB_MEASURE_TEST:
-					if (! info->lambda_transferred) SendMessage(hdlg, WMP_LOAD_SPEC_WAVELENGTHS, 0, 0);
-					if (wID == IDB_MEASURE) {
-						rc = Acquire_Raw_Spectrum(hdlg, info, &spectrum_info, &data);
-						npt = info->npt;
-					} else {
-						rc = Spec_Remote_Grab_Saved((wID == IDB_MEASURE_RAW) ? SPEC_SPECTRUM_RAW : SPEC_SPECTRUM_TEST, &data, &npt);
-					}
-					if (rc != 0) {
-						MessageBeep(MB_ICONERROR);
-					} else {
-						cv = info->cv_raw = ReallocRawCurve(hdlg, info, info->cv_raw, npt, 0, "sample", colors[0]);
-						for (i=0; i<npt; i++) cv->y[i] = data[i];
-						cv->modified = TRUE;
-						free(data);
-						SetDlgItemCheck(hdlg, IDC_SHOW_RAW, TRUE);
-						EnableDlgItem  (hdlg, IDC_SHOW_RAW, TRUE);
+					if (wNotifyCode == BN_CLICKED) {
+						if (! info->lambda_transferred) SendMessage(hdlg, WMP_LOAD_SPEC_WAVELENGTHS, 0, 0);
+						if (wID == IDB_MEASURE) {
+							rc = Acquire_Raw_Spectrum(hdlg, info, &spectrum_info, &data);
+							npt = info->npt;
+						} else {
+							rc = Spec_Remote_Grab_Saved((wID == IDB_MEASURE_RAW) ? SPEC_SPECTRUM_RAW : SPEC_SPECTRUM_TEST, &data, &npt);
+						}
+						if (rc != 0) {
+							Beep(ERROR_BEEP_FREQ, ERROR_BEEP_MS);
+						} else {
+							cv = info->cv_raw = ReallocRawCurve(hdlg, info, info->cv_raw, npt, 0, "sample", colors[0]);
+							for (i=0; i<npt; i++) cv->y[i] = data[i];
+							cv->modified = TRUE;
+							free(data);
+							SetDlgItemCheck(hdlg, IDC_SHOW_RAW, TRUE);
+							EnableDlgItem  (hdlg, IDC_SHOW_RAW, TRUE);
 
-						SendMessage(hdlg, WMP_UPDATE_RAW_AXIS_SCALES, 0, 0);		/* Does a redraw */
-						SendMessage(hdlg, WMP_PROCESS_MEASUREMENT, 0, 0);
+							SendMessage(hdlg, WMP_UPDATE_RAW_AXIS_SCALES, 0, 0);		/* Does a redraw */
+							SendMessage(hdlg, WMP_PROCESS_MEASUREMENT, 0, 0);
+						}
+
+						if (GetDlgItemCheck(hdlg, IDC_AUTOREFINE)) SendMessage(hdlg, WMP_REFINE_FIT, 0, 0);
+
+						if (GetDlgItemCheck(hdlg, IDC_AUTOFILE)) {
+							char pathname[PATH_MAX], dir[PATH_MAX], fname[PATH_MAX];
+
+							GetDlgItemText(hdlg, IDV_AUTOFILE_DIR,  dir, sizeof(dir));
+							GetDlgItemText(hdlg, IDV_AUTOFILE_FILE, fname, sizeof(fname));
+							if (*fname == '\0') { 
+								strcpy_s(fname, sizeof(fname), "scan");
+								SetDlgItemText(hdlg, IDV_AUTOFILE_FILE, fname);
+							}
+							i = GetDlgItemIntEx(hdlg, IDV_AUTOFILE_NUM);
+							if (*dir == '\0') {
+								sprintf_s(pathname, sizeof(pathname), "%s_%4.4d.csv", fname, i);
+							} else {
+								sprintf_s(pathname, sizeof(pathname), "%s/%s_%4.4d.csv", dir, fname, i);
+							}
+							
+							if (SaveData(info, pathname) != 0) {					/* Disable if problems */
+								Beep(ERROR_BEEP_FREQ, ERROR_BEEP_MS);
+								SetDlgItemCheck(hdlg, IDC_AUTOFILE, FALSE);
+								EnableDlgItem(hdlg, IDB_AUTOFILE_RESET, FALSE);
+								EnableDlgItem(hdlg, IDB_AUTOFILE_EDIT, FALSE);
+								EnableDlgItem(hdlg, IDV_AUTOFILE_DIR, FALSE);
+								EnableDlgItem(hdlg, IDV_AUTOFILE_FILE, FALSE);
+								EnableDlgItem(hdlg, IDV_AUTOFILE_NUM, FALSE);
+							} else {
+								sprintf_s(szBuf, sizeof(szBuf), "%4.4d", i+1);
+								SetDlgItemText(hdlg, IDV_AUTOFILE_NUM, szBuf);
+							}
+						}
 					}
 					rcode = TRUE; break;
 
@@ -1002,7 +1106,7 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 
 				/* Clear the film stack completely */
 				case IDB_FILM_CLEAR:
-					SendMessage(hdlg, WMP_CLEAR_SAMPLE_STACK, 0, 0);
+					if (wNotifyCode == BN_CLICKED) SendMessage(hdlg, WMP_CLEAR_SAMPLE_STACK, 0, 0);
 					rcode = TRUE; break;
 
 				/* Substrate ... all valid except none */
@@ -1010,11 +1114,25 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 					if (wNotifyCode == CBN_SELCHANGE) {
 						info->sample.substrate = ComboBoxGetIntValue(hdlg, wID);
 						if (info->sample.substrate <= 0) {									/* Don't allow it to be "none" */
-							MessageBeep(MB_ICONERROR);
+							Beep(ERROR_BEEP_FREQ, ERROR_BEEP_MS);
 							info->sample.substrate = 1;
 							ComboBoxSetByIntValue(hdlg, wID, info->sample.substrate);
 						}
 					}
+					rcode = TRUE; break;
+					
+				case IDC_LOG_REFINES:
+					enable = GetDlgItemCheck(hdlg, wID);
+					EnableDlgItem(hdlg, IDV_LOGFILE, enable);
+					EnableDlgItem(hdlg, IDB_EDIT_LOGFILE, enable);
+					if (enable) {
+						GetDlgItemText(hdlg, IDV_LOGFILE, szBuf, sizeof(szBuf));
+						if (*szBuf == '\0') SetDlgItemText(hdlg, IDV_LOGFILE, "logfile.csv");
+					}
+					rcode = TRUE; break;
+					
+				case IDB_EDIT_LOGFILE:
+					if (wNotifyCode == BN_CLICKED) QueryLogfile(hdlg, IDV_LOGFILE);
 					rcode = TRUE; break;
 					
 				/* Sample structure */
@@ -1105,14 +1223,14 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 					rcode = TRUE; break;
 
 				case IDB_REF_CLEAR:
-					SendMessage(hdlg, WMP_CLEAR_REFERENCE_STACK, 0, 0);
+					if (wNotifyCode == BN_CLICKED) SendMessage(hdlg, WMP_CLEAR_REFERENCE_STACK, 0, 0);
 					rcode = TRUE; break;
 
 				case IDC_REF_SUBSTRATE:
 					if (wNotifyCode == CBN_SELCHANGE) {
 						info->reference.substrate = ComboBoxGetIntValue(hdlg, wID);
 						if (info->reference.substrate <= 0) {							/* Don't allow it to be "none" */
-							MessageBeep(MB_ICONERROR);
+							Beep(ERROR_BEEP_FREQ, ERROR_BEEP_MS);
 							info->reference.substrate = 1;
 							ComboBoxSetByIntValue(hdlg, wID, info->reference.substrate);
 						}
@@ -1158,42 +1276,13 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 					rcode = TRUE; break;
 
 				case IDB_TRY:
-					SendMessage(hdlg, WMP_PROCESS_MEASUREMENT, 0, 0);
+					if (wNotifyCode == BN_CLICKED) SendMessage(hdlg, WMP_PROCESS_MEASUREMENT, 0, 0);
 					rcode = TRUE; break;
 
 				case IDB_FIT:
-					SendMessage(hdlg, WMP_MAKE_SAMPLE_STACK, 0, 0);				/* Has all data for moment */
-					do_fit(hdlg, info);													/* go and let it run */
-
-					/* Record values and replot new fit ... then deal with sigma */
-					ilayer = 0;																/* Which layer in the final structure */
-					nvary = 1;																/* # parameters varied (always scaling) */
-					for (i=0; i<N_FILM_STACK; i++) {
-						if (info->sample.imat[i] == 0) continue;					/* A nothing layer (doesn't get to stack */
-						if (info->sample.vary[i]) info->sample.nm[i] = info->sample.stack[ilayer].nm;
-						ilayer++; nvary++;
-					}
-					SetDlgItemDouble(hdlg, IDV_FIT_SCALING, "%.3f", info->fit_parms.scaling);
-					CalcChiSqr(info->lambda, info->cv_refl->y, info->cv_refl->s, info->tfoc_fit, info->npt, info->fit_parms.lambda_min, info->fit_parms.lambda_max, &chisqr, &dof);
-					chisqr = chisqr*dof/max(1,dof-nvary);							/* Correct for # of free parameters */
-					dof -= nvary;
-					SetDlgItemDouble(hdlg, IDT_CHISQR, "%.3f", sqrt(chisqr));
-					SetDlgItemInt(hdlg, IDT_DOF, dof, TRUE);
-
-					/* Fake the sigma based on chisqr ... too many people would not understand the link with chisqr_\nu */
-					ilayer = 0;
-					for (i=0; i<N_FILM_STACK; i++) {
-						SetDlgItemText(hdlg, IDT_SIGMA_0+i, "");
-						if (info->sample.imat[i] == 0) continue;					/* Not a real layer */
-						if (info->sample.vary) {
-							SetDlgItemDouble(hdlg, IDT_SIGMA_0+i, "%.2f", info->sample.stack[ilayer].sigma*sqrt(chisqr));
-						}
-						ilayer++;
-					}
-					SendMessage(hdlg, WMP_SHOW_SAMPLE_STRUCTURE, 0, 0);			/* Redraw the sample */
-					SendMessage(hdlg, WMP_UPDATE_MAIN_AXIS_SCALES, 0, 0);			/* Redraw the results */
+					if (wNotifyCode == BN_CLICKED) SendMessage(hdlg, WMP_REFINE_FIT, 0, 0);
 					rcode = TRUE; break;
-
+					
 				case IDV_FIT_LAMBDA_MIN:
 					if (wNotifyCode == EN_KILLFOCUS) {
 						info->fit_parms.lambda_min = GetDlgItemDouble(hdlg, wID);
@@ -1212,10 +1301,10 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 
 				case IDV_FIT_SCALING:
 					if (wNotifyCode == EN_KILLFOCUS) {
-						info->fit_parms.scaling = GetDlgItemDouble(hdlg, wID);
-						if (info->fit_parms.scaling < 0.5) info->fit_parms.scaling = 0.5;
-						if (info->fit_parms.scaling > 2.0) info->fit_parms.scaling = 2.0;
-						SetDlgItemDouble(hdlg, wID, "%.3f", info->fit_parms.scaling);
+						info->sample.scaling = GetDlgItemDouble(hdlg, wID);
+						if (info->sample.scaling < 0.5) info->sample.scaling = 0.5;
+						if (info->sample.scaling > 2.0) info->sample.scaling = 2.0;
+						SetDlgItemDouble(hdlg, wID, "%.3f", info->sample.scaling);
 						SendMessage(hdlg, WMP_PROCESS_MEASUREMENT, 0, 0);
 					}
 					rcode = TRUE; break;
@@ -1237,14 +1326,62 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 					rcode = TRUE; break;
 
 				case IDB_SAVE_DATA:
-					SaveData(info, NULL);
+					if (wNotifyCode == BN_CLICKED) SaveData(info, NULL);
 					rcode = TRUE; break;
 
 				case IDB_LOAD_DATA:
-					LoadData(info, NULL);
+					if (wNotifyCode == BN_CLICKED) LoadData(info, NULL);
+					rcode = TRUE; break;
+
+				case IDV_MEASURE_DELAY:
+					if (wNotifyCode == EN_KILLFOCUS && GetDlgItemCheck(hdlg, IDC_AUTOMEASURE)) {
+						ms = 1000*GetDlgItemIntEx(hdlg, IDV_MEASURE_DELAY);		/* Convert to ms */
+						if (ms <= 1000) { ms = 1000; SetDlgItemText(hdlg, IDV_MEASURE_DELAY, "1"); }
+						SetTimer(hdlg, TIMER_AUTO_MEASURE, ms, NULL);				/* Update spectrometer parameters seconds (if live) */
+					}
+					rcode = TRUE; break;
+
+				case IDC_AUTOMEASURE:
+					if (GetDlgItemCheck(hdlg, wID)) {									/* Enable ... start timer */
+						ms = 1000*GetDlgItemIntEx(hdlg, IDV_MEASURE_DELAY);		/* Convert to ms */
+						if (ms <= 1000) { ms = 1000; SetDlgItemText(hdlg, IDV_MEASURE_DELAY, "1"); }
+						SetTimer(hdlg, TIMER_AUTO_MEASURE, 1000, NULL);				/* Update spectrometer parameters seconds (if live) */
+					} else {
+						KillTimer(hdlg, TIMER_AUTO_MEASURE);
+					}
+					rcode = TRUE; break;
+
+				case IDC_AUTOFILE:
+					enable = GetDlgItemCheck(hdlg, wID);
+					EnableDlgItem(hdlg, IDB_AUTOFILE_RESET, enable);
+					EnableDlgItem(hdlg, IDB_AUTOFILE_EDIT, enable);
+					EnableDlgItem(hdlg, IDV_AUTOFILE_DIR, enable);
+					EnableDlgItem(hdlg, IDV_AUTOFILE_FILE, enable);
+					EnableDlgItem(hdlg, IDV_AUTOFILE_NUM, enable);
+					rcode = TRUE; break;
+
+				case IDV_AUTOFILE_NUM:
+					if (wNotifyCode == EN_KILLFOCUS) {
+						i = GetDlgItemIntEx(hdlg, wID);
+						if (i < 0) i = 0;
+						sprintf_s(szBuf, sizeof(szBuf), "%4.4d", i);
+						SetDlgItemText(hdlg, IDV_AUTOFILE_NUM, szBuf);
+					}
+					rcode = TRUE; break;
+
+				case IDB_AUTOFILE_EDIT:
+					QueryAutofile(hdlg);
+					rcode = TRUE; break;
+
+				case IDB_AUTOFILE_RESET:
+					if (wNotifyCode == BN_CLICKED) SetDlgItemText(hdlg, IDV_AUTOFILE_NUM, "0000");
 					rcode = TRUE; break;
 
 				/* Know to be unused notification codes (handled otherwise) */
+				case IDV_AUTOFILE_DIR:
+				case IDV_AUTOFILE_FILE:
+				case IDV_LOGFILE:
+				case IDC_AUTOREFINE:
 				case IDT_SIGMA_0:
 				case IDT_SIGMA_1:
 				case IDT_SIGMA_2:
@@ -1471,6 +1608,114 @@ static int Acquire_Raw_Spectrum(HWND hdlg, FILM_MEASURE_INFO *info, SPEC_SPECTRU
 		MessageBox(hdlg, szBuf, "Spectrum acquisition failure", MB_ICONERROR | MB_OK);
 		return 2;
 	}
+	return 0;
+}
+
+
+/* ===========================================================================
+-- Get elements of the autosave filename
+--
+-- Usage: int QueryAutofile(HWND hdlg);
+--
+-- Inputs: hdlg - current dialog box
+--         wID  - id of control that will be filled with the filename
+--
+-- Output: potentially modifies filename in wID
+--
+-- Returns: 0 if successful, !0 on any errors or cancel
+=========================================================================== */
+static int QueryAutofile(HWND hdlg) {
+	static char *rname = "QueryAutofile";
+
+	static char local_dir[PATH_MAX]="";						/* Directory -- keep for multiple calls */
+
+	OPENFILENAME ofn;
+	char pathname[1024], *aptr, *bptr;						/* Pathname - save for multiple calls */
+
+	/* Do we have a specified filename?  If not, query via dialog box */
+	strcpy_m(pathname, sizeof(pathname), "scan.csv");	/* Pathname must be initialized with a value */
+	ofn.lStructSize       = sizeof(OPENFILENAME);
+	ofn.hwndOwner         = hdlg;
+	ofn.lpstrTitle        = "Autofile directory and template (ext removed)";
+	ofn.lpstrFilter       = "Excel csv file (*.csv)\0*.csv\0All files (*.*)\0*.*\0\0";
+	ofn.lpstrCustomFilter = NULL;
+	ofn.nMaxCustFilter    = 0;
+	ofn.nFilterIndex      = 1;
+	ofn.lpstrFile         = pathname;				/* Full path */
+	ofn.nMaxFile          = sizeof(pathname);
+	ofn.lpstrFileTitle    = NULL;						/* Partial path */
+	ofn.nMaxFileTitle     = 0;
+	ofn.lpstrDefExt       = "csv";
+	ofn.lpstrInitialDir   = (*local_dir=='\0' ? NULL : local_dir);
+	ofn.Flags = OFN_LONGNAMES | OFN_NOCHANGEDIR | OFN_HIDEREADONLY;
+
+	/* Query a filename ... if abandoned, just return now with no complaints */
+	if (! GetSaveFileName(&ofn)) return 1;
+
+	/* Save the directory for the next time */
+	strcpy_m(local_dir, sizeof(local_dir), pathname);
+	local_dir[ofn.nFileOffset-1] = '\0';					/* Save for next time! */
+
+	SetDlgItemText(hdlg, IDV_AUTOFILE_DIR, local_dir);
+
+	aptr = pathname+ofn.nFileOffset;							/* Get the filename only */
+	bptr = aptr+strlen(aptr)-1;
+	while (*bptr != '.' && bptr != aptr) bptr--;
+	if (bptr != aptr && *bptr == '.') *bptr = '\0';
+	SetDlgItemText(hdlg, IDV_AUTOFILE_FILE, aptr);
+
+	SetDlgItemText(hdlg, IDV_AUTOFILE_NUM, "0000");
+
+	return 0;
+}
+
+
+/* ===========================================================================
+-- Get a filename for the logfile
+--
+-- Usage: int QueryLogfile(HWND hdlg, int wID);
+--
+-- Inputs: hdlg - current dialog box
+--         wID  - id of control that will be filled with the filename
+--
+-- Output: potentially modifies filename in wID
+--
+-- Returns: 0 if successful, !0 on any errors or cancel
+=========================================================================== */
+static int QueryLogfile(HWND hdlg, int wID) {
+	static char *rname = "QueryLogfile";
+
+	static char local_dir[PATH_MAX]="";						/* Directory -- keep for multiple calls */
+
+	OPENFILENAME ofn;
+	char pathname[1024];											/* Pathname - save for multiple calls */
+
+	/* Do we have a specified filename?  If not, query via dialog box */
+	strcpy_m(pathname, sizeof(pathname), "logfile.csv");	/* Pathname must be initialized with a value */
+	ofn.lStructSize       = sizeof(OPENFILENAME);
+	ofn.hwndOwner         = hdlg;
+	ofn.lpstrTitle        = "Refine results log file";
+	ofn.lpstrFilter       = "text data (*.dat)\0*.dat\0Excel csv file (*.csv)\0*.csv\0All files (*.*)\0*.*\0\0";
+	ofn.lpstrCustomFilter = NULL;
+	ofn.nMaxCustFilter    = 0;
+	ofn.nFilterIndex      = 2;
+	ofn.lpstrFile         = pathname;				/* Full path */
+	ofn.nMaxFile          = sizeof(pathname);
+	ofn.lpstrFileTitle    = NULL;						/* Partial path */
+	ofn.nMaxFileTitle     = 0;
+	ofn.lpstrDefExt       = "csv";
+	ofn.lpstrInitialDir   = (*local_dir=='\0' ? NULL : local_dir);
+	ofn.Flags = OFN_LONGNAMES | OFN_NOCHANGEDIR | OFN_HIDEREADONLY;
+
+	/* Query a filename ... if abandoned, just return now with no complaints */
+	if (! GetSaveFileName(&ofn)) return 1;
+
+	/* Save the directory for the next time */
+	strcpy_m(local_dir, sizeof(local_dir), pathname);
+	local_dir[ofn.nFileOffset-1] = '\0';					/* Save for next time! */
+
+	/* All okay, so set and return */
+	SetDlgItemText(hdlg, wID, pathname);
 	return 0;
 }
 
@@ -2021,7 +2266,7 @@ static int InitMaterialsList(void) {
 	char pattern[PATH_MAX+1];
 	char path[PATH_MAX+1];
 	intptr_t hdir;								/* Directory handle */
-	struct _finddatai64_t findbuf;		/* Information from FindFirst		*/
+	struct _finddata_t findbuf;			/* Information from FindFirst		*/
 
 	database = Find_TFOC_Database(NULL, 0, NULL);
 	fprintf(stderr, "Using database: \"%s\"\n", database); fflush(stderr);
@@ -2033,7 +2278,7 @@ static int InitMaterialsList(void) {
 
 	_makepath_s(pattern, sizeof(pattern), NULL, path, "*", "*");		/* Match all entries in the directory */
 
-	hdir = _findfirst64(pattern, &findbuf);
+	hdir = _findfirst(pattern, &findbuf);
 	if (hdir < 0) {
 		fprintf(stderr, "hdir returns %d  (pattern=%s)\n", hdir, pattern); fflush(stderr);
 		return -1;							/* Either an error (including no entries) */
@@ -2056,7 +2301,7 @@ static int InitMaterialsList(void) {
 		}
 		materials[materials_cnt].id = _strdup(findbuf.name); materials[materials_cnt].value = materials_cnt;	/* Always the first one */
 		materials_cnt++;
-	} while (_findnext64(hdir, &findbuf) == 0);
+	} while (_findnext(hdir, &findbuf) == 0);
 	_findclose(hdir);
 
 	return materials_cnt;
@@ -2259,6 +2504,28 @@ TFOC_SAMPLE *MakeSample(int nlayers, FILM_LAYERS *films) {
 	return sample;
 }
 
+/* ===========================================================================
+-- Routine to calculate the theoretical reflectance (with possible correction for fitting work)
+--
+-- Usage: int TFOC_GetReflData(TFOC_SAMPLE *sample, double scaling, double theta, POLARIZATION mode, double temperature, int npt, double *lambda, double *refl);
+--
+-- Inputs: sample  - pointer to TFOC_SAMPLE structure describing the film stack
+--         scaling - scaling factor that ultimately will be applied to data, but here *divides* the calculated reflectance
+--                   for production, this should be 1.0 giving exact values
+--                   A value of 1.2 would normally scale up experimental data by a factor of 1.2
+--                     but in this routine scales down the calculated reflectivity by the same 1.2
+--                   This permits comparison of raw data to calculations in fit
+--         theta - angle of incidence
+--         polarization - obvious
+--         temperature  - obvious
+--         npt - number of points in the data set
+--         lambda - pointer to existing wavelengths to be processed
+--         refl   - pointer to array to be filled with reflectance values
+--
+-- Output: *refl - filled with reflectance at each of the given wavelengths
+--
+-- Return: 0 if successful
+=========================================================================== */
 int TFOC_GetReflData(TFOC_SAMPLE *sample, double scaling, double theta, POLARIZATION mode, double temperature, int npt, double *lambda, double *refl) {
 
 	int i,j;
@@ -2313,7 +2580,7 @@ int TFOC_GetReflData(TFOC_SAMPLE *sample, double scaling, double theta, POLARIZA
 			sample[j].n = TFOC_FindNK(sample[j].material, lambda[i]);
 		}
 		TFOC_MakeLayers(sample, layers, temperature, lambda[i]);
-		refl[i] = scaling*TFOC_ReflN(theta, mode, lambda[i], layers).R;
+		refl[i] = TFOC_ReflN(theta, mode, lambda[i], layers).R / scaling;
 	}
 
 	return 0;
@@ -2381,7 +2648,7 @@ static int nls_eval(NLS_DATA *nls) {
 	FILM_MEASURE_INFO *info;
 	info = main_info;
 
-	TFOC_GetReflData(info->sample.tfoc, info->fit_parms.scaling, 0.0, UNPOLARIZED, 300.0, info->npt, info->lambda, nls->yfit);
+	TFOC_GetReflData(info->sample.tfoc, info->sample.scaling, 0.0, UNPOLARIZED, 300.0, info->npt, info->lambda, nls->yfit);
 
 	return 0;
 }
@@ -2434,7 +2701,7 @@ static int nls_deriv(double *results, NLS_DATA *nls, int ipt) {
 		}
 
 		/* Evaluate at the center point */
-		TFOC_GetReflData(info->sample.tfoc, info->fit_parms.scaling, 0.0, UNPOLARIZED, 300.0, info->npt, info->lambda, center);
+		TFOC_GetReflData(info->sample.tfoc, info->sample.scaling, 0.0, UNPOLARIZED, 300.0, info->npt, info->lambda, center);
 
 		for (i=0; i<nls->nvars; i++) {
 			v = nls->vars[i];
@@ -2445,7 +2712,7 @@ static int nls_deriv(double *results, NLS_DATA *nls, int ipt) {
 				delta = 0.01;
 			}
 			*v +=   delta;
-			TFOC_GetReflData(info->sample.tfoc, info->fit_parms.scaling, 0.0, UNPOLARIZED, 300.0, info->npt, info->lambda, fderiv[i]);
+			TFOC_GetReflData(info->sample.tfoc, info->sample.scaling, 0.0, UNPOLARIZED, 300.0, info->npt, info->lambda, fderiv[i]);
 			for (j=0; j<info->npt; j++) fderiv[i][j] = (fderiv[i][j]-center[j])/delta;
 			*v = tmp;
 		}
@@ -2520,7 +2787,7 @@ static int do_fit(HWND hdlg, FILM_MEASURE_INFO *info) {
 		j++;
 	}
 	/* And then add in the scaling factor (always appropriate for small changes in illumination intensity) */
-	nls->vars[j] = &info->fit_parms.scaling;
+	nls->vars[j] = &info->sample.scaling;
 	nls->lower[j] = info->fit_parms.scaling_min;
 	nls->upper[j] = info->fit_parms.scaling_max;
 	var_names[j] = "scaling";
@@ -2611,22 +2878,40 @@ FitExit:
 	/* Clean up workspaces and exit */
 	CurveFit(NKEY_EXIT, 0, nls);					/* Free allocated workspaces	*/
 
-	/* Generate the final fit and copy both to tfoc_fit and cv_fit curve */
-	info->tfoc_fit = realloc(info->tfoc_fit, info->npt * sizeof(*info->tfoc_fit));
-	TFOC_GetReflData(info->sample.tfoc, info->fit_parms.scaling, 0.0, UNPOLARIZED, 300.0, info->npt, info->lambda, info->tfoc_fit);
-	if (info->cv_fit != NULL) {
-		for (i=0; i<info->npt; i++) info->cv_fit->y[i] = info->tfoc_fit[i];
-		info->cv_fit->modified = TRUE;
-	}
+	/* If we are mostly successful, transfer back */
+	if (rcode >= 0) {												/* Only in case of success */
 
-	for (i=0,j=0; i<info->sample.layers; i++) {
-		if (info->sample.stack[i].vary) {
-			info->sample.stack[i].nm    = info->sample.tfoc[i+1].z;		/* layer 0 is air */
-			info->sample.stack[i].sigma = nls->sigma[j];
-			j++;
+		/* Transfer values from tfoc structure back into the sample stack */
+		for (i=0,j=0; i<info->sample.layers; i++) {
+			if (info->sample.stack[i].vary) {
+				info->sample.stack[i].nm    = info->sample.tfoc[i+1].z;		/* layer 0 is air */
+				info->sample.stack[i].sigma = nls->sigma[j];
+				j++;
+			}
+		}
+
+		/* Do we want to log these results? */
+		if (GetDlgItemCheck(hdlg, IDC_LOG_REFINES)) {
+			FILE *funit;
+			char pathname[PATH_MAX];
+
+			GetDlgItemText(hdlg, IDV_LOGFILE, pathname, sizeof(pathname));
+			if (*pathname == '\0' || fopen_s(&funit, pathname, "a") != 0) {
+				Beep(ERROR_BEEP_FREQ, ERROR_BEEP_MS);
+				SetDlgItemCheck(hdlg, IDC_LOG_REFINES, FALSE);
+				EnableDlgItem(hdlg, IDV_LOGFILE, FALSE);
+				EnableDlgItem(hdlg, IDB_EDIT_LOGFILE, FALSE);
+			} else {
+				fprintf(funit, "%lld", time(NULL));
+				for (i=0; i<nls->nvars; i++) {
+					fprintf(funit, ",%g,%g", *nls->vars[i], nls->sigma[i]*sqrt(nls->chisqr));
+				}
+				fprintf(funit, "\n");
+				fclose(funit);
+			}
 		}
 	}
 
-	fflush(stdout);
+	fflush(NULL);
 	return rcode;
 }

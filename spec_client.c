@@ -178,10 +178,9 @@ int main(int argc, char *argv[]) {
 -- Output: Creates MUTEX semaphores, opens socket, sets atexit() to ensure closure
 --
 -- Return:  0 - successful
---          1 - unable to create semaphores for controlling access to hardware
---          2 - unable to open the sockets (one or the other)
---          3 - unable to query the server version
---          4 - server / client version mismatch
+--          1 - unable to open the sockets (one or the other)
+--          2 - unable to query the server version
+--          3 - server / client version mismatch
 --
 -- Notes: Must be called before any attempt to communicate across the socket
 =========================================================================== */
@@ -200,16 +199,20 @@ int Init_Spec_Client(char *IP_address) {
 
 	if ( (Spec_Remote = ConnectToServer("Spec", IP_address, SPEC_MSG_LISTEN_PORT, &rc)) == NULL) {
 		fprintf(stderr, "ERROR[%s]: Failed to connect to the server\n", rname); fflush(stderr);
-		return -1;
+		return 1;
 	}
 
 	/* Immediately check the version numbers of the client (here) and the server (other end) */
 	/* Report an error if they do not match.  Code version must match */
 	server_version = Spec_Remote_Query_Server_Version();
-	if (server_version != SPEC_CLIENT_SERVER_VERSION) {
+	if (server_version <= 0) {
+		fprintf(stderr, "ERROR[%s]: Unable to query server version\n", rname); fflush(stderr);
+		CloseServerConnection(Spec_Remote); Spec_Remote = NULL;
+		return 2;
+	} else if (server_version != SPEC_CLIENT_SERVER_VERSION) {
 		fprintf(stderr, "ERROR[%s]: Version mismatch between server (%d) and client (%d)\n", rname, server_version, SPEC_CLIENT_SERVER_VERSION); fflush(stderr);
 		CloseServerConnection(Spec_Remote); Spec_Remote = NULL;
-		return 4;
+		return 3;
 	}
 
 	/* Report success, and if not close everything that has been started */

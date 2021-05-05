@@ -7,7 +7,7 @@
 -- would BREAK EXISTING COMPILATIONS.  Version is checked by the client
 -- open routine, so as long as this changes, don't expect problems.
 =========================================================================== */
-#define	SPEC_CLIENT_SERVER_VERSION	(1002)			/* Version of this code */
+#define	SPEC_CLIENT_SERVER_VERSION	(1003)			/* Version of this code */
 
 /* =============================
 -- Port that the server runs
