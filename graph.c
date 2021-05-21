@@ -1258,7 +1258,7 @@ LRESULT CALLBACK GraphWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 			/* Switch on events always allowed */
 			switch (wID) {
 				case IDB_CLEAR:
-					SendMessage(hwnd, WMP_CLEAR, 0, 0);
+					if (BN_CLICKED == wNotifyCode) SendMessage(hwnd, WMP_CLEAR, 0, 0);
 					rc = 0; break;
 				default:
 					return DefWindowProc(hwnd, msg, wParam, lParam);

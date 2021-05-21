@@ -1,5 +1,9 @@
 #define	N_FILM_STACK	(5)				/* Number of layers on the dialog box */
 
+#ifndef PATH_MAX
+	#define PATH_MAX	(260)
+#endif
+
 typedef struct _FILM_LAYERS {
 	char layer_name[32];						/* name of the layer (layer 1, layer 2, ...) */
 	char material[32];						/* material (file in the database) */
@@ -54,11 +58,16 @@ typedef struct _FILM_MEASURE_INFO {
 		TFOC_SAMPLE *tfoc;						/* TFOC structure for sample film stack */
 		int layers;									/* # of layers (including substrate) in stack */
 	} sample;
-	
+
 	struct {
 		double lambda_min, lambda_max;		/* X range (wavelength) for fitting */
 		double scaling_min, scaling_max;		/* Scaling min/max (multiplicative) */
 	} fit_parms;
+
+	enum {S_START, S_PAUSE, S_CONTINUE} TimeSeries_Status;
+	BOOL TimeSeries_Initialized;
+	char TimeSeries_Path[PATH_MAX];			/* Time series pathname */
+	int TimeSeries_Count;
 
 } FILM_MEASURE_INFO;
 
@@ -73,7 +82,7 @@ typedef struct _FILM_MEASURE_INFO {
 #define	WMP_PROCESS_REFERENCE			(WM_APP+7)
 #define	WMP_RECALC_RAW_REFLECTANCE		(WM_APP+8)
 #define	WMP_PROCESS_MEASUREMENT			(WM_APP+9)
-#define	WMP_REFINE_FIT						(WM_APP+10)
+#define	WMP_DO_FIT							(WM_APP+10)
 
 #define	WMP_CLEAR_SAMPLE_STACK			(WM_APP+11)
 #define	WMP_SHOW_SAMPLE_STRUCTURE		(WM_APP+12)

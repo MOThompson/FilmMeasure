@@ -66,7 +66,7 @@
 #endif
 
 #ifndef PATH_MAX
-	#define	PATH_MAX	260
+	#define PATH_MAX (260)
 #endif
 
 /* ------------------------------- */
@@ -96,7 +96,7 @@ static int CalcChiSqr(double *x, double *y, double *s, double *yfit, int npt, do
 static int do_fit(HWND hdlg, FILM_MEASURE_INFO *info);
 
 static int QueryLogfile(HWND hdlg, int wID);
-static int QueryAutofile(HWND hdlg);
+static int QueryTimeSeriesFile(HWND hdlg, char *path, int pathlen);
 static int SaveData(FILM_MEASURE_INFO *info, char *fname);
 static int LoadData(FILM_MEASURE_INFO *info, char *path);
 static int WriteProfileInfo(HWND hdlg, FILM_MEASURE_INFO *info);
@@ -131,6 +131,7 @@ static int colors[7] = {						/* Color scheme for the graphs (and the legend) */
 	RGB(0,192,192),	/* residuals - cyan */
 	RGB(128,128,128)	/* Absorbance - grey */
 };
+
 
 /* ===========================================================================
 -- Entry point for windows applications
@@ -180,22 +181,32 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 
 	BOOL rcode, enable;
 	int wID, wNotifyCode;
-	int i, ms, nvary, ilayer, rc;
+	int i, ipt, ms, nvary, ilayer, rc;
 	char szBuf[256];
+	FILE *funit;
 
 	FILM_LAYERS *stack;
 	int imat, nlayers;
 
 	FILM_MEASURE_INFO *info;						/* General structure for the window */
 
+	/* List of IP addresses */
+	static CB_PTR_LIST ip_list[] = {
+		{"Manual",								NULL},
+		{"Loop back [127.0.0.1]",			LOOPBACK_SERVER_IP_ADDRESS}, 
+		{"Chess-host [128.253.129.74]",	"128.253.129.74"},
+		{"LSA-host   [128.253.129.71]",	"128.253.129.71"}
+	};
+
 	static int spec_hide_list[] = { 
-		IDS_SPEC_TXT_0, IDS_SPEC_TXT_1, IDS_SPEC_TXT_2, IDS_SPEC_TXT_3, IDS_SPEC_TXT_4, IDS_SPEC_TXT_5, IDS_SPEC_TXT_6,
+		IDS_SPEC_TXT_0, IDS_SPEC_TXT_1, IDS_SPEC_TXT_2, IDS_SPEC_TXT_3, IDS_SPEC_TXT_4, IDS_SPEC_TXT_5,
 		IDT_MODEL, IDT_SERIAL, IDT_LAMBDA_MIN, IDT_LAMBDA_MAX, IDT_SPECTRUM_LENGTH,
 		IDC_DARK_PIXELS, IDC_NL_POLYNOMIAL, IDT_MS_INTEGRATE, IDT_AVERAGES, IDB_SPEC_PARMS_UPDATE, 
 		ID_NULL };
 	static int spec_disable_list[] = { 
 		IDB_COLLECT_DARK, IDB_COLLECT_REFERENCE, IDB_MEASURE,
 		IDB_TAKE_DARK, IDB_TAKE_REFERENCE, IDB_MEASURE_RAW, IDB_MEASURE_TEST,
+		IDR_TIMESERIES_REFL, IDR_TIMESERIES_RAW, IDB_TIMESERIES, 
 		ID_NULL };
 
 	SPEC_SPECTRUM_INFO spectrum_info;
@@ -203,7 +214,7 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 	GRAPH_CURVE *cv;
 	GRAPH_SCALES scales;
 	GRAPH_ZFORCE zforce;
-	double rval, lower, upper, chisqr, *data;
+	double rval, lower, upper, delta, chisqr, *data;
 	int npt, dof;
 
 	/* List of controls which will respond to <ENTER> with a WM_NEXTDLGCTL message */
@@ -217,19 +228,11 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 		IDV_FIT_SCALING, IDV_FIT_SCALING_MIN, IDV_FIT_SCALING_MAX, 
 		IDV_GRAPH_LAMBDA_MAX, IDV_GRAPH_LAMBDA_MIN, 
 		IDV_SPEC_IP, IDV_MEASURE_DELAY, IDV_LOGFILE,
-		IDV_AUTOFILE_DIR, IDV_AUTOFILE_FILE, IDV_AUTOFILE_NUM,
+		IDV_TIMESERIES_PATH,
 		ID_NULL };
 
 	HWND hwndTest;
 	int *hptr;
-
-	/* List of IP addresses */
-	static CB_PTR_LIST ip_list[] = {
-		{"Manual",								NULL},
-		{"Loop back [127.0.0.1]",			LOOPBACK_SERVER_IP_ADDRESS}, 
-		{"Chess-host [128.253.129.74]",	"128.253.129.74"},
-		{"LSA-host   [128.253.129.71]",	"128.253.129.71"}
-	};
 
 /* Recover the information data associated with this window */
 	if (msg != WM_INITDIALOG) info = (FILM_MEASURE_INFO *) GetWindowLongPtr(hdlg, GWLP_USERDATA);
@@ -270,8 +273,8 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 				info->lambda_autoscale = TRUE;
 				info->fit_parms.lambda_min  = 300.0;		/* Fitting parameters */
 				info->fit_parms.lambda_max  = 800.0;
-				info->fit_parms.scaling_min = 0.95;
-				info->fit_parms.scaling_max = 1.05;
+				info->fit_parms.scaling_min = 0.90;
+				info->fit_parms.scaling_max = 1.10;
 				info->sample.scaling        = 1.0;
 				info->reference.substrate = FindMaterialIndex("c-Si", NULL);
 				if (info->reference.substrate <= 0) info->reference.substrate = 1;
@@ -329,9 +332,17 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 			SetDlgItemDouble(hdlg, IDV_FIT_SCALING_MAX, "%.2f", info->fit_parms.scaling_max);
 
 			SetDlgItemInt(hdlg, IDV_MEASURE_DELAY, 1, FALSE);
-			SetDlgItemText(hdlg, IDV_AUTOFILE_DIR, ".");
-			SetDlgItemText(hdlg, IDV_AUTOFILE_FILE, "scan");
-			SetDlgItemText(hdlg, IDV_AUTOFILE_NUM, "0000");
+
+			SetDlgItemCheck(hdlg, IDC_LOG_FITS, FALSE);
+			SetDlgItemText(hdlg, IDV_LOGFILE, "logfile.csv");
+
+			info->TimeSeries_Status = S_START;
+			info->TimeSeries_Initialized = FALSE;
+			info->TimeSeries_Count = 0;
+			strcpy_s(info->TimeSeries_Path, sizeof(info->TimeSeries_Path), "timeseries.csv");
+			SetDlgItemText(hdlg, IDV_TIMESERIES_PATH, info->TimeSeries_Path);
+			SetDlgItemText(hdlg, IDB_TIMESERIES, "Start");
+			SetRadioButton(hdlg, IDR_TIMESERIES_REFL, IDR_TIMESERIES_RAW, IDR_TIMESERIES_REFL);
 
 			rcode = TRUE; break;
 
@@ -472,9 +483,9 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 					cv = info->cv_fit = ReallocReflCurve(hdlg, info, info->cv_fit, info->npt, 4, "fit", colors[4]);
 					memcpy(cv->x,  info->lambda, info->npt*sizeof(double));
 				}
-				if (info->cv_residual != NULL) {
-					cv = info->cv_residual = ReallocResidualCurve(hdlg, info, info->cv_residual, info->npt, 4, "residual", colors[5]);
-					memcpy(cv->x,  info->lambda, info->npt*sizeof(double));
+				if (info->cv_residual != NULL) {											/* Just delete since array size is likely different */
+					SendDlgItemMessage(hdlg, IDU_GRAPH, WMP_CLEAR_CURVE_BY_POINTER, (WPARAM) info->cv_residual, 0);
+					info->cv_residual = NULL;										
 				}
 				if (info->tfoc_reference != NULL) free(info->tfoc_reference);	/* These will be regenerated when needed */
 				if (info->tfoc_fit  != NULL) free(info->tfoc_fit);					/* Lengths may have changed */
@@ -518,15 +529,15 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 					}
 
 					/* And since checking everything, update whether we have spectra */
-					SetDlgItemCheck(hdlg, IDC_SHOW_RAW,   info->cv_raw   != NULL);
+					SetDlgItemCheck(hdlg, IDC_SHOW_RAW,   info->cv_raw   != NULL ? info->cv_raw->visible   : FALSE);
 					EnableDlgItem  (hdlg, IDC_SHOW_RAW,   info->cv_raw   != NULL);
-					SetDlgItemCheck(hdlg, IDC_SHOW_DARK,  info->cv_dark  != NULL);
+					SetDlgItemCheck(hdlg, IDC_SHOW_DARK,  info->cv_dark  != NULL ? info->cv_dark->visible  : FALSE);
 					EnableDlgItem  (hdlg, IDC_SHOW_DARK,  info->cv_dark  != NULL);
-					SetDlgItemCheck(hdlg, IDC_SHOW_REF,   info->cv_ref   != NULL);
+					SetDlgItemCheck(hdlg, IDC_SHOW_REF,   info->cv_ref   != NULL ? info->cv_ref->visible   : FALSE);
 					EnableDlgItem  (hdlg, IDC_SHOW_REF,   info->cv_ref   != NULL);
-					SetDlgItemCheck(hdlg, IDC_SHOW_LIGHT, info->cv_light != NULL);
+					SetDlgItemCheck(hdlg, IDC_SHOW_LIGHT, info->cv_light != NULL ? info->cv_light->visible : FALSE);
 					EnableDlgItem  (hdlg, IDC_SHOW_LIGHT, info->cv_light != NULL);
-					SetDlgItemCheck(hdlg, IDC_SHOW_FIT,   info->cv_fit   != NULL);
+					SetDlgItemCheck(hdlg, IDC_SHOW_FIT,   info->cv_fit   != NULL ? info->cv_fit->visible   : FALSE);
 					EnableDlgItem  (hdlg, IDC_SHOW_FIT,   info->cv_fit   != NULL);
 				}
 			}
@@ -738,8 +749,8 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 				}
 				for (i=0; i<cv->npt; i++) light[i] /= vmax;
 				cv->modified = TRUE;
-				SetDlgItemCheck(hdlg, IDC_SHOW_LIGHT, TRUE);
-				EnableDlgItem  (hdlg, IDC_SHOW_LIGHT, TRUE);
+				EnableDlgItem  (hdlg, IDC_SHOW_LIGHT, TRUE);				/* Make sure enabled */
+				SetDlgItemCheck(hdlg, IDC_SHOW_LIGHT, cv->visible);	/* But leave off if had been set off */
 			}
 			rcode = TRUE; break;
 
@@ -754,13 +765,19 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 				for (i=0; i<cv->npt; i++) {										/* Calculate the normalized reflectance */
 					if (dark != NULL) {
 						cv->y[i] = (raw[i]-dark[i]) / max(1.0,ref[i]-dark[i]) ;
+						cv->s[i]  = pow(1.0/max(1.0,fabs(ref[i]-dark[i])),2) * fabs(raw[i]);								/* First term in sigma^2 */
+						cv->s[i] += pow((raw[i]-dark[i])/pow(max(1.0,fabs(ref[i]-dark[i])),2),2) * fabs(ref[i]);	/* Second term in sigma^2 */
+						cv->s[i] += pow(-1.0/max(1.0,fabs(ref[i]-dark[i])) + (raw[i]-dark[i])/pow(max(1.0,fabs(ref[i]-dark[i])),2),2) * fabs(dark[i]);
+						cv->s[i] = sqrt(cv->s[i]);
 					} else {
 						cv->y[i] = raw[i] / max(1.0,ref[i]) ;
+						cv->s[i] = cv->y[i] * sqrt(1.0/max(1.0,raw[i]) + 1.0/max(1.0,ref[i]));	/* Fractional uncertainty ... no dark */
 					}
-					cv->s[i] = sqrt(1.0/max(1.0,raw[i]) + 1.0/max(1.0,ref[i]));		/* Fractional uncertainty (unbiased by scaling) */
-					cv->y[i] = max(-1.0, min(2.0, cv->y[i]));
-					if (info->tfoc_reference != NULL) cv->y[i] *= info->tfoc_reference[i];
-					cv->s[i] = cv->s[i] * cv->y[i];								/* Been calculating fractional relative error */
+					if (info->tfoc_reference != NULL) {							/* Scale by known reflectance of given sample */
+						cv->y[i] *= info->tfoc_reference[i];					/* Now absolute ... */
+						cv->s[i] *= info->tfoc_reference[i];					/* Also scale the uncertainty */
+					}
+					cv->y[i] = max(-1.0, min(2.0, cv->y[i]));					/* Limit so graphing clean */
 				}
 				cv->modified = TRUE;
 			}
@@ -787,18 +804,18 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 				for (i=0; i<cv->npt; i++) cv->y[i] = info->tfoc_fit[i];
 				cv->modified = TRUE;
 
-				SetDlgItemCheck(hdlg, IDC_SHOW_FIT, TRUE);
-				EnableDlgItem  (hdlg, IDC_SHOW_FIT, TRUE);
+				EnableDlgItem  (hdlg, IDC_SHOW_FIT, TRUE);			/* Make sure enabled */
+				SetDlgItemCheck(hdlg, IDC_SHOW_FIT, cv->visible);	/* But leave off if had been set off */
 
 				/* Create a curve with residuals display */
 				cv = info->cv_residual = ReallocResidualCurve(hdlg, info, info->cv_residual, info->npt, 4, "residual", colors[5]);
-				for (i=0; i<cv->npt; i++) {
-					if (info->lambda[i] < info->fit_parms.lambda_min || info->lambda[i] > info->fit_parms.lambda_max) {
-						cv->y[i] = 0.0;
-					} else {
-						cv->y[i] = info->cv_refl->y[i] - info->tfoc_fit[i];
-					}
+				for (i=0,ipt=0; i<cv->npt; i++) {
+					if (info->lambda[i] < info->fit_parms.lambda_min || info->lambda[i] > info->fit_parms.lambda_max) continue;
+					cv->x[ipt] = info->lambda[i];
+					cv->y[ipt] = info->cv_refl->y[i] - info->tfoc_fit[i];
+					ipt++;
 				}
+				cv->npt = ipt;
 				cv->modified = TRUE;
 				cv->visible  = GetDlgItemCheck(hdlg, IDC_SHOW_RESIDUAL);	/* By default, don't show */
 				EnableDlgItem(hdlg, IDC_SHOW_RESIDUAL, TRUE);				/* But enable being able to show */
@@ -811,7 +828,7 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 			}
 			rcode = TRUE; break;
 
-		case WMP_REFINE_FIT:
+		case WMP_DO_FIT:
 			SendMessage(hdlg, WMP_MAKE_SAMPLE_STACK, 0, 0);				/* Has all data for moment */
 			SendMessage(hdlg, WMP_RECALC_RAW_REFLECTANCE, 0, 0);		/* Raw ignores "scaling" correction (processed differently in fit) */
 			do_fit(hdlg, info);													/* go and let it run */
@@ -869,13 +886,13 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 				/*  List for the IP address of the SPEC server
 				/* ============================================ */
 				case IDL_SPEC_IP:
-					if (wNotifyCode == CBN_SELCHANGE) {
+					if (CBN_SELCHANGE == wNotifyCode) {
 						char *aptr;
 						if ( (aptr = ComboBoxGetPtrValue(hdlg, wID)) != NULL) {			/* Have a new IP */
 							EnableWindow(GetDlgItem(hdlg, IDV_SPEC_IP), FALSE);			/* Disable the manual field */
 							strcpy_m(szBuf, sizeof(szBuf), aptr);								/* Copy new IP address into szBuf */
 						} else {																			/* Switch to manual */
-							EnableWindow(GetDlgItem(hdlg, IDV_SPEC_IP), TRUE);				/* Enable the manual field */
+							EnableDlgItem(hdlg, IDV_SPEC_IP, TRUE);							/* Enable the manual field */
 							GetDlgItemText(hdlg, IDV_SPEC_IP, szBuf, sizeof(szBuf));		/* Get what is there currently */
 							strip_white_space(szBuf);												/* Validate and use current if anything wrong */
 							if (validate_IP_address(szBuf) != 0) strcpy_m(szBuf, sizeof(szBuf), info->spec_IP);
@@ -888,7 +905,7 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 					rcode = TRUE; break;
 
 				case IDV_SPEC_IP:
-					if (wNotifyCode == EN_KILLFOCUS) {
+					if (EN_KILLFOCUS == wNotifyCode) {
 
 						GetDlgItemText(hdlg, wID, szBuf, sizeof(szBuf));	/* Read new IP and validate */
 						strip_white_space(szBuf);
@@ -907,8 +924,9 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 					}
 					rcode = TRUE; break;
 
+					/* Really connect / disconnect */
 				case IDB_INITIALIZE_SPEC:
-					if (wNotifyCode == BN_CLICKED) {
+					if (BN_CLICKED == wNotifyCode) {
 						if (info->spec_ok) {
 							Shutdown_Spec_Client();	info->spec_ok = FALSE;
 						} else {
@@ -919,17 +937,19 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 					rcode = TRUE; break;
 
 				case IDB_SPEC_PARMS_UPDATE:
-					if (wNotifyCode == BN_CLICKED) SendMessage(hdlg, WMP_UPDATE_SPEC_PARMS, 0, 0);
+					if (BN_CLICKED == wNotifyCode) SendMessage(hdlg, WMP_UPDATE_SPEC_PARMS, 0, 0);
 					rcode = TRUE; break;
 					
 				case IDC_AUTORANGE_WAVELENGTH:
-					enable = GetDlgItemCheck(hdlg, wID);
-					EnableDlgItem(hdlg, IDV_GRAPH_LAMBDA_MIN, ! enable);
-					EnableDlgItem(hdlg, IDV_GRAPH_LAMBDA_MAX, ! enable);
+					if (BN_CLICKED == wNotifyCode) {
+						enable = GetDlgItemCheck(hdlg, wID);
+						EnableDlgItem(hdlg, IDV_GRAPH_LAMBDA_MIN, ! enable);
+						EnableDlgItem(hdlg, IDV_GRAPH_LAMBDA_MAX, ! enable);
+					}
 					rcode = TRUE; break;
 
 				case IDV_GRAPH_LAMBDA_MIN:
-					if (wNotifyCode== EN_KILLFOCUS) {
+					if (EN_KILLFOCUS == wNotifyCode) {
 						info->lambda_min = GetDlgItemDouble(hdlg, wID);
 						SetDlgItemDouble(hdlg, wID, "%.1f", info->lambda_min);
 						SendMessage(hdlg, WMP_UPDATE_MAIN_AXIS_SCALES, 0, 0);		/* Does a redraw */
@@ -938,7 +958,7 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 					rcode = TRUE; break;
 					
 				case IDV_GRAPH_LAMBDA_MAX:
-					if (wNotifyCode== EN_KILLFOCUS) {
+					if (EN_KILLFOCUS == wNotifyCode) {
 						info->lambda_max = GetDlgItemDouble(hdlg, wID);
 						SetDlgItemDouble(hdlg, wID, "%.1f", info->lambda_max);
 						SendMessage(hdlg, WMP_UPDATE_MAIN_AXIS_SCALES, 0, 0);		/* Does a redraw */
@@ -948,7 +968,7 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 						
 				case IDB_COLLECT_REFERENCE:
 				case IDB_TAKE_REFERENCE:
-					if (wNotifyCode == BN_CLICKED) {
+					if (BN_CLICKED == wNotifyCode) {
 						if (! info->lambda_transferred) SendMessage(hdlg, WMP_LOAD_SPEC_WAVELENGTHS, 0, 0);
 						if (wID == IDB_COLLECT_REFERENCE) {
 							rc = Acquire_Raw_Spectrum(hdlg, info, &spectrum_info, &data);
@@ -963,8 +983,9 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 							for (i=0; i<npt; i++) cv->y[i] = data[i];
 							cv->modified = TRUE;
 							free(data);
-							SetDlgItemCheck(hdlg, IDC_SHOW_REF, TRUE);
-							EnableDlgItem  (hdlg, IDC_SHOW_REF, TRUE);
+							EnableDlgItem  (hdlg, IDC_SHOW_REF, TRUE);			/* Make sure enabled */
+							SetDlgItemCheck(hdlg, IDC_SHOW_REF, cv->visible);	/* But leave off if had been set off */
+							EnableDlgItem  (hdlg, IDB_CLEAR_REF, TRUE);
 
 							SendMessage(hdlg, WMP_PROCESS_REFERENCE, 0, 0);
 							SendMessage(hdlg, WMP_UPDATE_RAW_AXIS_SCALES, 0, 0);		/* Does a redraw */
@@ -974,7 +995,7 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 
 				case IDB_COLLECT_DARK:
 				case IDB_TAKE_DARK:
-					if (wNotifyCode == BN_CLICKED) {
+					if (BN_CLICKED == wNotifyCode) {
 						if (! info->lambda_transferred) SendMessage(hdlg, WMP_LOAD_SPEC_WAVELENGTHS, 0, 0);
 						if (wID == IDB_COLLECT_DARK) {
 							rc = Acquire_Raw_Spectrum(hdlg, info, &spectrum_info, &data);
@@ -989,8 +1010,9 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 							for (i=0; i<npt; i++) cv->y[i] = data[i];
 							cv->modified = TRUE;
 							free(data);
-							SetDlgItemCheck(hdlg, IDC_SHOW_DARK, TRUE);
-							EnableDlgItem  (hdlg, IDC_SHOW_DARK, TRUE);
+							EnableDlgItem  (hdlg, IDC_SHOW_DARK, TRUE);			/* Make sure enabled */
+							SetDlgItemCheck(hdlg, IDC_SHOW_DARK, cv->visible);	/* But leave off if had been set off */
+							EnableDlgItem  (hdlg, IDB_CLEAR_DARK, TRUE);
 
 							SendMessage(hdlg, WMP_UPDATE_RAW_AXIS_SCALES, 0, 0);		/* Does a redraw */
 						}
@@ -1000,7 +1022,7 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 				case IDB_MEASURE:
 				case IDB_MEASURE_RAW:
 				case IDB_MEASURE_TEST:
-					if (wNotifyCode == BN_CLICKED) {
+					if (BN_CLICKED == wNotifyCode) {
 						if (! info->lambda_transferred) SendMessage(hdlg, WMP_LOAD_SPEC_WAVELENGTHS, 0, 0);
 						if (wID == IDB_MEASURE) {
 							rc = Acquire_Raw_Spectrum(hdlg, info, &spectrum_info, &data);
@@ -1015,103 +1037,178 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 							for (i=0; i<npt; i++) cv->y[i] = data[i];
 							cv->modified = TRUE;
 							free(data);
-							SetDlgItemCheck(hdlg, IDC_SHOW_RAW, TRUE);
-							EnableDlgItem  (hdlg, IDC_SHOW_RAW, TRUE);
+							EnableDlgItem  (hdlg, IDC_SHOW_RAW, TRUE);			/* Make sure enabled */
+							SetDlgItemCheck(hdlg, IDC_SHOW_RAW, cv->visible);	/* But leave off if had been set off */
 
-							SendMessage(hdlg, WMP_UPDATE_RAW_AXIS_SCALES, 0, 0);		/* Does a redraw */
+							SendMessage(hdlg, WMP_UPDATE_RAW_AXIS_SCALES, 0, 0);			/* Does a redraw */
 							SendMessage(hdlg, WMP_PROCESS_MEASUREMENT, 0, 0);
 						}
 
-						if (GetDlgItemCheck(hdlg, IDC_AUTOREFINE)) SendMessage(hdlg, WMP_REFINE_FIT, 0, 0);
-
-						if (GetDlgItemCheck(hdlg, IDC_AUTOFILE)) {
-							char pathname[PATH_MAX], dir[PATH_MAX], fname[PATH_MAX];
-
-							GetDlgItemText(hdlg, IDV_AUTOFILE_DIR,  dir, sizeof(dir));
-							GetDlgItemText(hdlg, IDV_AUTOFILE_FILE, fname, sizeof(fname));
-							if (*fname == '\0') { 
-								strcpy_s(fname, sizeof(fname), "scan");
-								SetDlgItemText(hdlg, IDV_AUTOFILE_FILE, fname);
+						/* Generally do the fit unless specifically asked not to */
+						if (! GetDlgItemCheck(hdlg, IDC_DISABLE_AUTOFIT) && info->cv_dark != NULL) {
+							SendMessage(hdlg, WMP_DO_FIT, 0, 0);
+							/* After an autofit, consider updating fit range so can always stay with some headroom for * fitting */
+							enable = FALSE;														/* Do we need to do a sample structure update? */
+							for (i=0; i<N_FILM_STACK; i++) {
+								if (! info->sample.vary[i]) continue;
+								rval = info->sample.nm[i];
+								lower = info->sample.tmin[i];
+								upper = info->sample.tmax[i];
+								if (upper <= lower) {											/* Might as well verify values here also */
+									lower = max(0,lower);										/* Make sure it is positive */
+									upper = max(upper, max(2.0*lower, 10.0));				/* Upper */
+									enable = TRUE;
+								}
+								delta = upper-lower;
+								if (rval-lower < 0.2*delta) {
+									info->sample.tmin[i] = max(0, rval-0.2*delta);		/* Extend downward potentially to zero */
+									enable = TRUE;
+								}
+								if (upper-rval < 0.2*delta) {
+									info->sample.tmax[i] = rval + 0.2*delta;				/* Give 20% headroom */
+									enable = TRUE;
+								}
 							}
-							i = GetDlgItemIntEx(hdlg, IDV_AUTOFILE_NUM);
-							if (*dir == '\0') {
-								sprintf_s(pathname, sizeof(pathname), "%s_%4.4d.csv", fname, i);
+							if (enable) SendMessage(hdlg, WMP_SHOW_SAMPLE_STRUCTURE, 0,0);
+						}
+
+						if (info->TimeSeries_Status == S_PAUSE && info->cv_refl != NULL) {
+							if ( fopen_s(&funit, info->TimeSeries_Path, info->TimeSeries_Initialized ? "a" : "w") != 0) {
+								fprintf(stderr, "Failed to open the file\n"); fflush(stderr);
 							} else {
-								sprintf_s(pathname, sizeof(pathname), "%s/%s_%4.4d.csv", dir, fname, i);
-							}
-							
-							if (SaveData(info, pathname) != 0) {					/* Disable if problems */
-								Beep(ERROR_BEEP_FREQ, ERROR_BEEP_MS);
-								SetDlgItemCheck(hdlg, IDC_AUTOFILE, FALSE);
-								EnableDlgItem(hdlg, IDB_AUTOFILE_RESET, FALSE);
-								EnableDlgItem(hdlg, IDB_AUTOFILE_EDIT, FALSE);
-								EnableDlgItem(hdlg, IDV_AUTOFILE_DIR, FALSE);
-								EnableDlgItem(hdlg, IDV_AUTOFILE_FILE, FALSE);
-								EnableDlgItem(hdlg, IDV_AUTOFILE_NUM, FALSE);
-							} else {
-								sprintf_s(szBuf, sizeof(szBuf), "%4.4d", i+1);
-								SetDlgItemText(hdlg, IDV_AUTOFILE_NUM, szBuf);
+								if (! info->TimeSeries_Initialized) {
+									fprintf(funit, "# Line 1 = reference, Line 2 = dark, Line 3 = reference reflectance, Line 4 = lambda, Line n... data\n");
+
+									/* Save the reference counts */
+									fprintf(funit, "%lld", time(NULL));
+									for (i=0; i<info->npt; i++) fprintf(funit, ",%.1f",info->cv_ref->y[i]);
+									fprintf(funit, "\n");
+
+									/* Save the dark (background) data */
+									fprintf(funit, "%lld", time(NULL));
+									for (i=0; i<info->npt; i++) fprintf(funit, ",%.1f",(info->cv_dark != NULL) ? info->cv_dark->y[i] : 0.0);
+									fprintf(funit, "\n");
+
+									/* Save the reference counts */
+									fprintf(funit, "%lld", time(NULL));
+									for (i=0; i<info->npt; i++) fprintf(funit, ",%.3f",info->tfoc_reference[i]);
+									fprintf(funit, "\n");
+
+									/* Save the wavelength data */
+									fprintf(funit, "%lld", time(NULL));
+									for (i=0; i<info->npt; i++) fprintf(funit, ",%.3f",info->lambda[i]);
+									fprintf(funit, "\n");
+
+									EnableDlgItem(hdlg, IDR_TIMESERIES_REFL, FALSE);		/* Don't allow it to be changed from now on */
+									EnableDlgItem(hdlg, IDR_TIMESERIES_RAW,  FALSE);
+									info->TimeSeries_Initialized = TRUE;
+								}
+
+								/* Write either raw or reflectance curve (corrected by ref/dark) */
+								fprintf(funit, "%lld", time(NULL));
+								if (GetRadioButton(hdlg, IDR_TIMESERIES_REFL, IDR_TIMESERIES_RAW) == IDR_TIMESERIES_REFL) {
+									for (i=0; i<info->npt; i++) fprintf(funit, ",%.4f",info->cv_refl->y[i]);
+								} else {
+									for (i=0; i<info->npt; i++) fprintf(funit, ",%.4f",info->cv_raw->y[i]);
+								}
+								fprintf(funit, "\n");
+								fclose(funit);
+
+								info->TimeSeries_Count++;
+								SetDlgItemInt(hdlg, IDT_TIMESERIES_COUNT, info->TimeSeries_Count, FALSE);
 							}
 						}
+					}
+					rcode = TRUE; break;
+
+				case IDB_CLEAR_REF:
+					if (BN_CLICKED == wNotifyCode) {
+						if (info->cv_ref != NULL) SendDlgItemMessage(hdlg, IDU_RAW_GRAPH, WMP_CLEAR_CURVE_BY_POINTER, (WPARAM) info->cv_ref, 0);
+						info->cv_ref = NULL;
+						EnableDlgItem(hdlg, wID, FALSE);
+						SetDlgItemCheck(hdlg, IDC_SHOW_REF, FALSE);
+						EnableDlgItem(hdlg, IDC_SHOW_REF, FALSE);
+					}
+					rcode = TRUE; break;
+
+				case IDB_CLEAR_DARK:
+					if (BN_CLICKED == wNotifyCode) {
+						if (info->cv_dark != NULL) SendDlgItemMessage(hdlg, IDU_RAW_GRAPH, WMP_CLEAR_CURVE_BY_POINTER, (WPARAM) info->cv_dark, 0);
+						info->cv_dark = NULL;
+						EnableDlgItem(hdlg, wID, FALSE);
+						SetDlgItemCheck(hdlg, IDC_SHOW_DARK, FALSE);
+						EnableDlgItem(hdlg, IDC_SHOW_DARK, FALSE);
 					}
 					rcode = TRUE; break;
 
 				case IDC_SHOW_RAW:
-					if (info->cv_raw != NULL) {
-						info->cv_raw->visible = GetDlgItemCheck(hdlg, wID);
-						info->cv_raw->modified = TRUE;
-						SendDlgItemMessage(hdlg, IDU_RAW_GRAPH, WMP_REDRAW, 0, 0);		/* Redraw */
+					if (BN_CLICKED == wNotifyCode) {
+						if (info->cv_raw != NULL) {
+							info->cv_raw->visible = GetDlgItemCheck(hdlg, wID);
+							info->cv_raw->modified = TRUE;
+							SendDlgItemMessage(hdlg, IDU_RAW_GRAPH, WMP_REDRAW, 0, 0);		/* Redraw */
+						}
 					}
 					rcode = TRUE; break;
 
 				case IDC_SHOW_DARK:
-					if (info->cv_dark != NULL) {
-						info->cv_dark->visible = GetDlgItemCheck(hdlg, wID);
-						info->cv_dark->modified = TRUE;
-						SendDlgItemMessage(hdlg, IDU_RAW_GRAPH, WMP_REDRAW, 0, 0);		/* Redraw */
+					if (BN_CLICKED == wNotifyCode) {
+						if (info->cv_dark != NULL) {
+							info->cv_dark->visible = GetDlgItemCheck(hdlg, wID);
+							info->cv_dark->modified = TRUE;
+							SendDlgItemMessage(hdlg, IDU_RAW_GRAPH, WMP_REDRAW, 0, 0);		/* Redraw */
+						}
 					}
 					rcode = TRUE; break;
 
 				case IDC_SHOW_REF:
-					if (info->cv_ref != NULL) {
-						info->cv_ref->visible = GetDlgItemCheck(hdlg, wID);
-						info->cv_ref->modified = TRUE;
-						SendDlgItemMessage(hdlg, IDU_RAW_GRAPH, WMP_REDRAW, 0, 0);		/* Redraw */
+					if (BN_CLICKED == wNotifyCode) {
+						if (info->cv_ref != NULL) {
+							info->cv_ref->visible = GetDlgItemCheck(hdlg, wID);
+							info->cv_ref->modified = TRUE;
+							SendDlgItemMessage(hdlg, IDU_RAW_GRAPH, WMP_REDRAW, 0, 0);		/* Redraw */
+						}
 					}
 					rcode = TRUE; break;
 
 				case IDC_SHOW_LIGHT:
-					if (info->cv_light != NULL) {
-						info->cv_light->visible = GetDlgItemCheck(hdlg, wID);
-						info->cv_light->modified = TRUE;
-						SendDlgItemMessage(hdlg, IDU_RAW_GRAPH, WMP_REDRAW, 0, 0);		/* Redraw */
+					if (BN_CLICKED == wNotifyCode) {
+						if (info->cv_light != NULL) {
+							info->cv_light->visible = GetDlgItemCheck(hdlg, wID);
+							info->cv_light->modified = TRUE;
+							SendDlgItemMessage(hdlg, IDU_RAW_GRAPH, WMP_REDRAW, 0, 0);		/* Redraw */
+						}
 					}
 					rcode = TRUE; break;
 
 				case IDC_SHOW_FIT:
-					if (info->cv_fit != NULL) {
-						info->cv_fit->visible = GetDlgItemCheck(hdlg, wID);
-						info->cv_fit->modified = TRUE;
-						SendDlgItemMessage(hdlg, IDU_GRAPH, WMP_REDRAW, 0, 0);		/* Redraw */
+					if (BN_CLICKED == wNotifyCode) {
+						if (info->cv_fit != NULL) {
+							info->cv_fit->visible = GetDlgItemCheck(hdlg, wID);
+							info->cv_fit->modified = TRUE;
+							SendDlgItemMessage(hdlg, IDU_GRAPH, WMP_REDRAW, 0, 0);		/* Redraw */
+						}
 					}
 					rcode = TRUE; break;
 
 				case IDC_SHOW_RESIDUAL:
-					if (info->cv_residual != NULL) {
-						info->cv_residual->visible = GetDlgItemCheck(hdlg, wID);
-						info->cv_residual->modified = TRUE;
-						SendDlgItemMessage(hdlg, IDU_GRAPH, WMP_REDRAW, 0, 0);		/* Redraw */
+					if (BN_CLICKED == wNotifyCode) {
+						if (info->cv_residual != NULL) {
+							info->cv_residual->visible = GetDlgItemCheck(hdlg, wID);
+							info->cv_residual->modified = TRUE;
+							SendDlgItemMessage(hdlg, IDU_GRAPH, WMP_REDRAW, 0, 0);		/* Redraw */
+						}
 					}
 					rcode = TRUE; break;
 
 				/* Clear the film stack completely */
 				case IDB_FILM_CLEAR:
-					if (wNotifyCode == BN_CLICKED) SendMessage(hdlg, WMP_CLEAR_SAMPLE_STACK, 0, 0);
+					if (BN_CLICKED == wNotifyCode) SendMessage(hdlg, WMP_CLEAR_SAMPLE_STACK, 0, 0);
 					rcode = TRUE; break;
 
 				/* Substrate ... all valid except none */
 				case IDC_FILM_SUBSTRATE:
-					if (wNotifyCode == CBN_SELCHANGE) {
+					if (CBN_SELCHANGE == wNotifyCode) {
 						info->sample.substrate = ComboBoxGetIntValue(hdlg, wID);
 						if (info->sample.substrate <= 0) {									/* Don't allow it to be "none" */
 							Beep(ERROR_BEEP_FREQ, ERROR_BEEP_MS);
@@ -1121,18 +1218,20 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 					}
 					rcode = TRUE; break;
 					
-				case IDC_LOG_REFINES:
-					enable = GetDlgItemCheck(hdlg, wID);
-					EnableDlgItem(hdlg, IDV_LOGFILE, enable);
-					EnableDlgItem(hdlg, IDB_EDIT_LOGFILE, enable);
-					if (enable) {
-						GetDlgItemText(hdlg, IDV_LOGFILE, szBuf, sizeof(szBuf));
-						if (*szBuf == '\0') SetDlgItemText(hdlg, IDV_LOGFILE, "logfile.csv");
+				case IDC_LOG_FITS:
+					if (BN_CLICKED == wNotifyCode) {
+						enable = GetDlgItemCheck(hdlg, wID);
+						if (enable) {
+							GetDlgItemText(hdlg, IDV_LOGFILE, szBuf, sizeof(szBuf));
+							if (*szBuf == '\0') SetDlgItemText(hdlg, IDV_LOGFILE, "logfile.csv");
+						}
+						EnableDlgItem(hdlg, IDV_LOGFILE, ! enable);
+						EnableDlgItem(hdlg, IDB_EDIT_LOGFILE, ! enable);
 					}
 					rcode = TRUE; break;
 					
 				case IDB_EDIT_LOGFILE:
-					if (wNotifyCode == BN_CLICKED) QueryLogfile(hdlg, IDV_LOGFILE);
+					if (BN_CLICKED == wNotifyCode) QueryLogfile(hdlg, IDV_LOGFILE);
 					rcode = TRUE; break;
 					
 				/* Sample structure */
@@ -1141,7 +1240,7 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 				case IDC_FILM_MATERIAL_2:
 				case IDC_FILM_MATERIAL_3:
 				case IDC_FILM_MATERIAL_4:
-					if (wNotifyCode == CBN_SELCHANGE) {
+					if (CBN_SELCHANGE == wNotifyCode) {
 						i = wID - IDC_FILM_MATERIAL_0;
 						info->sample.imat[i] = ComboBoxGetIntValue(hdlg, wID);
 						if (info->sample.imat[i] < 0) info->sample.imat[i] = 0;
@@ -1155,18 +1254,20 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 				case IDC_VARY_2:
 				case IDC_VARY_3:
 				case IDC_VARY_4:
-					i = wID - IDC_VARY_0;
-					info->sample.vary[i] = GetDlgItemCheck(hdlg, wID);
-					if (info->sample.vary[i]) {									/* When enabled, set default search range */
-						rval  = info->sample.nm[i];
-						lower = info->sample.tmin[i];
-						upper = info->sample.tmax[i];
-						if (lower > rval) lower = 0.0;
-						if (upper < rval || upper > 2.0*rval) upper = max(10.0, 2.0 * rval);
-						info->sample.tmin[i] = lower;
-						info->sample.tmax[i] = upper;
+					if (BN_CLICKED == wNotifyCode) {
+						i = wID - IDC_VARY_0;
+						info->sample.vary[i] = GetDlgItemCheck(hdlg, wID);
+						if (info->sample.vary[i]) {									/* When enabled, set default search range */
+							rval  = info->sample.nm[i];
+							lower = info->sample.tmin[i];
+							upper = info->sample.tmax[i];
+							if (lower > rval) lower = 0.0;
+							if (upper < rval || upper > 2.0*rval) upper = max(10.0, 2.0 * rval);
+							info->sample.tmin[i] = lower;
+							info->sample.tmax[i] = upper;
+						}
+						SendMessage(hdlg, WMP_SHOW_SAMPLE_STRUCTURE, 0, 0);			/* Inefficient but so what */
 					}
-					SendMessage(hdlg, WMP_SHOW_SAMPLE_STRUCTURE, 0, 0);			/* Inefficient but so what */
 					rcode = TRUE; break;
 
 				/* Film thickness (may also update tmin/tmax if vary enabled */
@@ -1175,7 +1276,7 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 				case IDV_FILM_NM_2:
 				case IDV_FILM_NM_3:
 				case IDV_FILM_NM_4:
-					if (wNotifyCode == EN_KILLFOCUS) {
+					if (EN_KILLFOCUS == wNotifyCode) {
 						i = wID-IDV_FILM_NM_0;
 						if ( (rval = GetDlgItemDouble(hdlg, wID)) < 0) rval = 0.0;
 						info->sample.nm[i] = rval;
@@ -1184,7 +1285,7 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 							lower = info->sample.tmin[i];
 							upper = info->sample.tmax[i];
 							if (lower > rval) lower = 0.0;
-							if (upper < rval || upper > 2.0*rval) upper = max(10.0, 2.0 * rval);
+							if (upper < rval) upper = max(10.0, 2.0 * rval);
 							info->sample.tmin[i] = lower;
 							info->sample.tmax[i] = upper;
 						}
@@ -1197,7 +1298,7 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 				case IDV_NM_LOW_2:
 				case IDV_NM_LOW_3:
 				case IDV_NM_LOW_4:
-					if (wNotifyCode == EN_KILLFOCUS) {
+					if (EN_KILLFOCUS == wNotifyCode) {
 						i = wID-IDV_NM_LOW_0;
 						lower = GetDlgItemDouble(hdlg, wID);
 						if (lower > info->sample.nm[i]) lower = 0.0;
@@ -1212,7 +1313,7 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 				case IDV_NM_HIGH_2:
 				case IDV_NM_HIGH_3:
 				case IDV_NM_HIGH_4:
-					if (wNotifyCode == EN_KILLFOCUS) {
+					if (EN_KILLFOCUS == wNotifyCode) {
 						i = wID-IDV_NM_HIGH_0;
 						upper = GetDlgItemDouble(hdlg, wID);
 						if (upper < info->sample.nm[i]) upper = 2.0*info->sample.nm[i];
@@ -1223,11 +1324,11 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 					rcode = TRUE; break;
 
 				case IDB_REF_CLEAR:
-					if (wNotifyCode == BN_CLICKED) SendMessage(hdlg, WMP_CLEAR_REFERENCE_STACK, 0, 0);
+					if (BN_CLICKED == wNotifyCode) SendMessage(hdlg, WMP_CLEAR_REFERENCE_STACK, 0, 0);
 					rcode = TRUE; break;
 
 				case IDC_REF_SUBSTRATE:
-					if (wNotifyCode == CBN_SELCHANGE) {
+					if (CBN_SELCHANGE == wNotifyCode) {
 						info->reference.substrate = ComboBoxGetIntValue(hdlg, wID);
 						if (info->reference.substrate <= 0) {							/* Don't allow it to be "none" */
 							Beep(ERROR_BEEP_FREQ, ERROR_BEEP_MS);
@@ -1238,10 +1339,12 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 					rcode = TRUE; break;
 
 				case IDC_REF_MIRROR:
-					info->reference.mirror = GetDlgItemCheck(hdlg, wID);
-					SendMessage(hdlg, WMP_SHOW_REFERENCE_STRUCTURE, 0, 0);	/* Inefficient but so what */
-					SendMessage(hdlg, WMP_PROCESS_REFERENCE, 0,0);				/* Rebuild the corrections */
-					SendMessage(hdlg, WMP_UPDATE_RAW_AXIS_SCALES, 0, 0);		/* Does a redraw */
+					if (BN_CLICKED == wNotifyCode) {
+						info->reference.mirror = GetDlgItemCheck(hdlg, wID);
+						SendMessage(hdlg, WMP_SHOW_REFERENCE_STRUCTURE, 0, 0);	/* Inefficient but so what */
+						SendMessage(hdlg, WMP_PROCESS_REFERENCE, 0,0);				/* Rebuild the corrections */
+						SendMessage(hdlg, WMP_UPDATE_RAW_AXIS_SCALES, 0, 0);		/* Does a redraw */
+					}
 					rcode = TRUE; break;
 
 				case IDC_REF_MATERIAL_0:
@@ -1249,7 +1352,7 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 				case IDC_REF_MATERIAL_2:
 				case IDC_REF_MATERIAL_3:
 				case IDC_REF_MATERIAL_4:
-					if (wNotifyCode == CBN_SELCHANGE) {
+					if (CBN_SELCHANGE == wNotifyCode) {
 						i = wID - IDC_REF_MATERIAL_0;
 						info->reference.imat[i] = ComboBoxGetIntValue(hdlg, wID);
 						if (info->reference.imat[i] < 0) info->reference.imat[i] = 0;
@@ -1265,7 +1368,7 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 				case IDV_REF_NM_2:
 				case IDV_REF_NM_3:
 				case IDV_REF_NM_4:
-					if (wNotifyCode == EN_KILLFOCUS) {
+					if (EN_KILLFOCUS == wNotifyCode) {
 						i = wID - IDV_REF_NM_0;
 						if ( (rval = GetDlgItemDouble(hdlg, wID)) < 0) rval = 0.0;
 						info->reference.nm[i] = rval;
@@ -1276,23 +1379,23 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 					rcode = TRUE; break;
 
 				case IDB_TRY:
-					if (wNotifyCode == BN_CLICKED) SendMessage(hdlg, WMP_PROCESS_MEASUREMENT, 0, 0);
+					if (BN_CLICKED == wNotifyCode) SendMessage(hdlg, WMP_PROCESS_MEASUREMENT, 0, 0);
 					rcode = TRUE; break;
 
 				case IDB_FIT:
-					if (wNotifyCode == BN_CLICKED) SendMessage(hdlg, WMP_REFINE_FIT, 0, 0);
+					if (BN_CLICKED == wNotifyCode) SendMessage(hdlg, WMP_DO_FIT, 0, 0);
 					rcode = TRUE; break;
-					
+
 				case IDV_FIT_LAMBDA_MIN:
-					if (wNotifyCode == EN_KILLFOCUS) {
+					if (EN_KILLFOCUS == wNotifyCode) {
 						info->fit_parms.lambda_min = GetDlgItemDouble(hdlg, wID);
 						if (info->spec_ok && (info->fit_parms.lambda_min < info->status.lambda_min) ) info->fit_parms.lambda_min = info->status.lambda_min;
 						SetDlgItemDouble(hdlg, wID, "%.1f", info->fit_parms.lambda_min);
 					}
 					rcode = TRUE; break;
-					
+
 				case IDV_FIT_LAMBDA_MAX:
-					if (wNotifyCode == EN_KILLFOCUS) {
+					if (EN_KILLFOCUS == wNotifyCode) {
 						info->fit_parms.lambda_max = GetDlgItemDouble(hdlg, wID);
 						if (info->spec_ok && (info->fit_parms.lambda_max > info->status.lambda_max) ) info->fit_parms.lambda_max = info->status.lambda_max;
 						SetDlgItemDouble(hdlg, wID, "%.1f", info->fit_parms.lambda_max);
@@ -1300,17 +1403,17 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 					rcode = TRUE; break;
 
 				case IDV_FIT_SCALING:
-					if (wNotifyCode == EN_KILLFOCUS) {
+					if (EN_KILLFOCUS == wNotifyCode) {
 						info->sample.scaling = GetDlgItemDouble(hdlg, wID);
-						if (info->sample.scaling < 0.5) info->sample.scaling = 0.5;
-						if (info->sample.scaling > 2.0) info->sample.scaling = 2.0;
+						if (info->sample.scaling < 0.1) info->sample.scaling = 0.1;
+						if (info->sample.scaling > 50.0) info->sample.scaling = 50.0;
 						SetDlgItemDouble(hdlg, wID, "%.3f", info->sample.scaling);
 						SendMessage(hdlg, WMP_PROCESS_MEASUREMENT, 0, 0);
 					}
 					rcode = TRUE; break;
 
 				case IDV_FIT_SCALING_MIN:
-					if (wNotifyCode == EN_KILLFOCUS) {
+					if (EN_KILLFOCUS == wNotifyCode) {
 						info->fit_parms.scaling_min = GetDlgItemDouble(hdlg, wID);
 						if (info->fit_parms.scaling_min < 0.5) info->fit_parms.scaling_min = 0.5;
 						SetDlgItemDouble(hdlg, wID, "%.2f", info->fit_parms.scaling_min);
@@ -1318,23 +1421,23 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 					rcode = TRUE; break;
 
 				case IDV_FIT_SCALING_MAX:
-					if (wNotifyCode == EN_KILLFOCUS) {
+					if (EN_KILLFOCUS == wNotifyCode) {
 						info->fit_parms.scaling_max = GetDlgItemDouble(hdlg, wID);
-						if (info->fit_parms.scaling_max > 2.0) info->fit_parms.scaling_max = 2.0;
+						if (info->fit_parms.scaling_max > 50.0) info->fit_parms.scaling_max = 50.0;
 						SetDlgItemDouble(hdlg, wID, "%.2f", info->fit_parms.scaling_max);
 					}
 					rcode = TRUE; break;
 
 				case IDB_SAVE_DATA:
-					if (wNotifyCode == BN_CLICKED) SaveData(info, NULL);
+					if (BN_CLICKED == wNotifyCode) SaveData(info, NULL);
 					rcode = TRUE; break;
 
 				case IDB_LOAD_DATA:
-					if (wNotifyCode == BN_CLICKED) LoadData(info, NULL);
+					if (BN_CLICKED == wNotifyCode) LoadData(info, NULL);
 					rcode = TRUE; break;
 
 				case IDV_MEASURE_DELAY:
-					if (wNotifyCode == EN_KILLFOCUS && GetDlgItemCheck(hdlg, IDC_AUTOMEASURE)) {
+					if (EN_KILLFOCUS == wNotifyCode && GetDlgItemCheck(hdlg, IDC_AUTOMEASURE)) {
 						ms = 1000*GetDlgItemIntEx(hdlg, IDV_MEASURE_DELAY);		/* Convert to ms */
 						if (ms <= 1000) { ms = 1000; SetDlgItemText(hdlg, IDV_MEASURE_DELAY, "1"); }
 						SetTimer(hdlg, TIMER_AUTO_MEASURE, ms, NULL);				/* Update spectrometer parameters seconds (if live) */
@@ -1342,46 +1445,116 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 					rcode = TRUE; break;
 
 				case IDC_AUTOMEASURE:
-					if (GetDlgItemCheck(hdlg, wID)) {									/* Enable ... start timer */
-						ms = 1000*GetDlgItemIntEx(hdlg, IDV_MEASURE_DELAY);		/* Convert to ms */
-						if (ms <= 1000) { ms = 1000; SetDlgItemText(hdlg, IDV_MEASURE_DELAY, "1"); }
-						SetTimer(hdlg, TIMER_AUTO_MEASURE, 1000, NULL);				/* Update spectrometer parameters seconds (if live) */
-					} else {
-						KillTimer(hdlg, TIMER_AUTO_MEASURE);
+					if (BN_CLICKED == wNotifyCode) {
+						if (GetDlgItemCheck(hdlg, wID)) {									/* Enable ... start timer */
+							ms = 1000*GetDlgItemIntEx(hdlg, IDV_MEASURE_DELAY);		/* Convert to ms */
+							if (ms <= 1000) { ms = 1000; SetDlgItemText(hdlg, IDV_MEASURE_DELAY, "1"); }
+							SetTimer(hdlg, TIMER_AUTO_MEASURE, 1000, NULL);				/* Update spectrometer parameters seconds (if live) */
+						} else {
+							KillTimer(hdlg, TIMER_AUTO_MEASURE);
+						}
 					}
 					rcode = TRUE; break;
 
-				case IDC_AUTOFILE:
-					enable = GetDlgItemCheck(hdlg, wID);
-					EnableDlgItem(hdlg, IDB_AUTOFILE_RESET, enable);
-					EnableDlgItem(hdlg, IDB_AUTOFILE_EDIT, enable);
-					EnableDlgItem(hdlg, IDV_AUTOFILE_DIR, enable);
-					EnableDlgItem(hdlg, IDV_AUTOFILE_FILE, enable);
-					EnableDlgItem(hdlg, IDV_AUTOFILE_NUM, enable);
-					rcode = TRUE; break;
+				case IDB_TIMESERIES:
+					if (BN_CLICKED == wNotifyCode) {
+						struct _stat statbuf;
+						switch (info->TimeSeries_Status) {
+							case S_START:								/* Waiting to start */
+								info->TimeSeries_Initialized = FALSE;
+								if (_stat(info->TimeSeries_Path, &statbuf) == 0) {
+									sprintf_s(szBuf, sizeof(szBuf), "\"%s\" exists.\nAre you sure you want to overwrite this file?", info->TimeSeries_Path);
+									if (MessageBox(hdlg, szBuf, "TimeSeries Overwrite", MB_OKCANCEL | MB_ICONWARNING | MB_DEFBUTTON2) != IDOK) break;
+								}
+								if ( fopen_s(&funit, info->TimeSeries_Path, "w") != 0) {
+									sprintf_s(szBuf, sizeof(szBuf), "Unable to open \"%s\" for writing.\nPlease try again.", info->TimeSeries_Path);
+									MessageBox(hdlg, szBuf, "TimeSeries Failure", MB_OK | MB_ICONERROR);
+									break;
+								} else {
+									fprintf(stderr, "Successfully opened %s\n", info->TimeSeries_Path); fflush(stderr);
+									fclose(funit);
+								}
+								SetDlgItemText(hdlg, wID, "Pause");
+								EnableDlgItem(hdlg, IDV_TIMESERIES_PATH, FALSE);
+								EnableDlgItem(hdlg, IDB_TIMESERIES_EDIT, FALSE);
+								EnableDlgItem(hdlg, IDB_TIMESERIES_RESET, FALSE);
+								info->TimeSeries_Count = 0;
+								info->TimeSeries_Initialized = FALSE;
+								info->TimeSeries_Status = S_PAUSE;				/* Now waiting for a PAUSE command */
+								break;
 
-				case IDV_AUTOFILE_NUM:
-					if (wNotifyCode == EN_KILLFOCUS) {
-						i = GetDlgItemIntEx(hdlg, wID);
-						if (i < 0) i = 0;
-						sprintf_s(szBuf, sizeof(szBuf), "%4.4d", i);
-						SetDlgItemText(hdlg, IDV_AUTOFILE_NUM, szBuf);
+							case S_PAUSE:
+								SetDlgItemText(hdlg, wID, "Continue");
+								EnableDlgItem(hdlg, IDV_TIMESERIES_PATH, TRUE);
+								EnableDlgItem(hdlg, IDB_TIMESERIES_EDIT, TRUE);
+								EnableDlgItem(hdlg, IDB_TIMESERIES_RESET, TRUE);
+								info->TimeSeries_Status = S_CONTINUE;				/* Now waiting for a PAUSE command */
+								break;
+									
+							case S_CONTINUE:
+								SetDlgItemText(hdlg, wID, "Pause");
+								EnableDlgItem(hdlg, IDV_TIMESERIES_PATH, FALSE);
+								EnableDlgItem(hdlg, IDB_TIMESERIES_EDIT, FALSE);
+								EnableDlgItem(hdlg, IDB_TIMESERIES_RESET, FALSE);
+								info->TimeSeries_Status = S_PAUSE;				/* Now waiting for a PAUSE command */
+								break;
+
+							default:
+								fprintf(stderr, "VERY BAD PROGRAMMER ... Never should be here\n"); fflush(stderr);
+						}
 					}
 					rcode = TRUE; break;
 
-				case IDB_AUTOFILE_EDIT:
-					QueryAutofile(hdlg);
+				case IDB_TIMESERIES_EDIT:
+					GetDlgItemText(hdlg, IDV_TIMESERIES_PATH, szBuf, sizeof(szBuf));	/* Keep for comparison */
+					if (QueryTimeSeriesFile(hdlg, info->TimeSeries_Path, sizeof(info->TimeSeries_Path) ) == 0) {
+						if (_stricmp(szBuf, info->TimeSeries_Path) != 0) {					/* Pathname has changed */
+							SetDlgItemText(hdlg, IDV_TIMESERIES_PATH, info->TimeSeries_Path);
+							SetDlgItemText(hdlg, IDB_TIMESERIES, "Start");
+							EnableDlgItem(hdlg, IDB_TIMESERIES_RESET, FALSE);
+							SetDlgItemText(hdlg, IDT_TIMESERIES_COUNT, "0");
+							EnableDlgItem(hdlg, IDR_TIMESERIES_REFL, TRUE);
+							EnableDlgItem(hdlg, IDR_TIMESERIES_RAW,  TRUE);
+							info->TimeSeries_Initialized = FALSE;
+							info->TimeSeries_Status = S_START;
+							info->TimeSeries_Count = 0;
+						}
+					}
 					rcode = TRUE; break;
 
-				case IDB_AUTOFILE_RESET:
-					if (wNotifyCode == BN_CLICKED) SetDlgItemText(hdlg, IDV_AUTOFILE_NUM, "0000");
+				case IDV_TIMESERIES_PATH:
+					if (EN_KILLFOCUS == wNotifyCode) {
+						GetDlgItemText(hdlg, IDV_TIMESERIES_PATH, szBuf, sizeof(szBuf));
+						if (_stricmp(szBuf, info->TimeSeries_Path) != 0) {					/* Pathname has changed */
+							strcpy_s(info->TimeSeries_Path, sizeof(info->TimeSeries_Path), szBuf);
+							SetDlgItemText(hdlg, IDB_TIMESERIES, "Start");
+							EnableDlgItem(hdlg, IDB_TIMESERIES_RESET, FALSE);
+							SetDlgItemText(hdlg, IDT_TIMESERIES_COUNT, "0");
+							EnableDlgItem(hdlg, IDR_TIMESERIES_REFL, TRUE);
+							EnableDlgItem(hdlg, IDR_TIMESERIES_RAW,  TRUE);
+							info->TimeSeries_Initialized = FALSE;
+							info->TimeSeries_Status = S_START;
+							info->TimeSeries_Count = 0;
+						}
+					}
+					rcode = TRUE; break;
+
+				case IDB_TIMESERIES_RESET:
+					if (BN_CLICKED == wNotifyCode) {
+						info->TimeSeries_Initialized = FALSE;
+						info->TimeSeries_Count = 0;
+						SetDlgItemText(hdlg, IDT_TIMESERIES_COUNT, "0");
+						EnableDlgItem(hdlg, IDR_TIMESERIES_REFL, TRUE);
+						EnableDlgItem(hdlg, IDR_TIMESERIES_RAW,  TRUE);
+					}
 					rcode = TRUE; break;
 
 				/* Know to be unused notification codes (handled otherwise) */
-				case IDV_AUTOFILE_DIR:
-				case IDV_AUTOFILE_FILE:
+				case IDR_TIMESERIES_REFL:
+				case IDR_TIMESERIES_RAW:
+				case IDT_TIMESERIES_COUNT:
 				case IDV_LOGFILE:
-				case IDC_AUTOREFINE:
+				case IDC_DISABLE_AUTOFIT:
 				case IDT_SIGMA_0:
 				case IDT_SIGMA_1:
 				case IDT_SIGMA_2:
@@ -1615,28 +1788,29 @@ static int Acquire_Raw_Spectrum(HWND hdlg, FILM_MEASURE_INFO *info, SPEC_SPECTRU
 /* ===========================================================================
 -- Get elements of the autosave filename
 --
--- Usage: int QueryAutofile(HWND hdlg);
+-- Usage: int QueryTimeSeriesFile(HWND hdlg, char *path, int pathlen);
 --
 -- Inputs: hdlg - current dialog box
---         wID  - id of control that will be filled with the filename
+--         path - pointer to recieve new filename (if request)
+--         pathlen - length of the path buffer
 --
 -- Output: potentially modifies filename in wID
 --
 -- Returns: 0 if successful, !0 on any errors or cancel
 =========================================================================== */
-static int QueryAutofile(HWND hdlg) {
-	static char *rname = "QueryAutofile";
+static int QueryTimeSeriesFile(HWND hdlg, char *path, int pathlen) {
+	static char *rname = "QueryTimeSeriesFile";
 
 	static char local_dir[PATH_MAX]="";						/* Directory -- keep for multiple calls */
 
 	OPENFILENAME ofn;
-	char pathname[1024], *aptr, *bptr;						/* Pathname - save for multiple calls */
+	char pathname[1024];											/* Pathname - save for multiple calls */
 
 	/* Do we have a specified filename?  If not, query via dialog box */
-	strcpy_m(pathname, sizeof(pathname), "scan.csv");	/* Pathname must be initialized with a value */
+	strcpy_m(pathname, sizeof(pathname), "timeseries.csv");	/* Pathname must be initialized with a value */
 	ofn.lStructSize       = sizeof(OPENFILENAME);
 	ofn.hwndOwner         = hdlg;
-	ofn.lpstrTitle        = "Autofile directory and template (ext removed)";
+	ofn.lpstrTitle        = "TimeSeries Filename";
 	ofn.lpstrFilter       = "Excel csv file (*.csv)\0*.csv\0All files (*.*)\0*.*\0\0";
 	ofn.lpstrCustomFilter = NULL;
 	ofn.nMaxCustFilter    = 0;
@@ -1656,16 +1830,7 @@ static int QueryAutofile(HWND hdlg) {
 	strcpy_m(local_dir, sizeof(local_dir), pathname);
 	local_dir[ofn.nFileOffset-1] = '\0';					/* Save for next time! */
 
-	SetDlgItemText(hdlg, IDV_AUTOFILE_DIR, local_dir);
-
-	aptr = pathname+ofn.nFileOffset;							/* Get the filename only */
-	bptr = aptr+strlen(aptr)-1;
-	while (*bptr != '.' && bptr != aptr) bptr--;
-	if (bptr != aptr && *bptr == '.') *bptr = '\0';
-	SetDlgItemText(hdlg, IDV_AUTOFILE_FILE, aptr);
-
-	SetDlgItemText(hdlg, IDV_AUTOFILE_NUM, "0000");
-
+	strcpy_s(path, pathlen, pathname);
 	return 0;
 }
 
@@ -1694,7 +1859,7 @@ static int QueryLogfile(HWND hdlg, int wID) {
 	strcpy_m(pathname, sizeof(pathname), "logfile.csv");	/* Pathname must be initialized with a value */
 	ofn.lStructSize       = sizeof(OPENFILENAME);
 	ofn.hwndOwner         = hdlg;
-	ofn.lpstrTitle        = "Refine results log file";
+	ofn.lpstrTitle        = "Measurement log file";
 	ofn.lpstrFilter       = "text data (*.dat)\0*.dat\0Excel csv file (*.csv)\0*.csv\0All files (*.*)\0*.*\0\0";
 	ofn.lpstrCustomFilter = NULL;
 	ofn.nMaxCustFilter    = 0;
@@ -1807,11 +1972,12 @@ static int SaveData(FILM_MEASURE_INFO *info, char *path) {
 		fprintf(funit, "#   substrate \"%s\"\n", materials[imat].id);
 		fprintf(funit, "# END\n");
 
-		fprintf(funit, "# lambda,reflectance,raw,dark,reference,fit\n");
+		fprintf(funit, "# lambda,reflectance,uncertainty,raw,dark,reference,fit\n");
 		for (i=0; i<info->npt; i++) {
-			fprintf(funit, "%f,%f,%f,%f,%f,%f\n", 
+			fprintf(funit, "%f,%f,%f,%f,%f,%f,%f\n", 
 					  info->lambda[i], 
 					  (info->cv_refl != NULL) ? info->cv_refl->y[i] : 0.0 ,
+					  (info->cv_refl != NULL) ? info->cv_refl->s[i] : 0.0 ,
 					  (info->cv_raw  != NULL) ? info->cv_raw->y[i]  : 0.0 , 
 					  (info->cv_dark != NULL) ? info->cv_dark->y[i] : 0.0 ,
 					  (info->cv_ref  != NULL) ? info->cv_ref->y[i]  : 0.0 ,
@@ -1858,7 +2024,7 @@ static int LoadData(FILM_MEASURE_INFO *info, char *path) {
 	HWND hdlg;
 	enum {NORMAL, REFERENCE, SAMPLE} mode;
 
-	double *lambda, *raw, *dark, *ref, *refl;			/* Temporary buffers for read data */
+	double *lambda, *raw, *sigma, *dark, *ref, *refl;	/* Temporary buffers for read data */
 
 	/* This is needed so much, assign now */
 	hdlg = info->hdlg;
@@ -1922,6 +2088,7 @@ static int LoadData(FILM_MEASURE_INFO *info, char *path) {
 				} else {
 					lambda = calloc(npt, sizeof(double));			/* Temporary space for reading data */
 					raw    = calloc(npt, sizeof(double));
+					sigma  = calloc(npt, sizeof(double));
 					dark   = calloc(npt, sizeof(double));
 					ref    = calloc(npt, sizeof(double));
 					refl   = calloc(npt, sizeof(double));
@@ -1989,7 +2156,7 @@ static int LoadData(FILM_MEASURE_INFO *info, char *path) {
 
 			} else if (npt <= 0 || ! valid) {						/* Verify before saving numbers */
 				MessageBox(HWND_DESKTOP, "File is missing either the version identifier line or the NPT line.  Cannot ensure that this is a compatible file format", "File read failure", MB_ICONERROR | MB_OK);
-				if (lambda != NULL) { free(lambda); free(raw); free(dark); free(ref); free(refl); }
+				if (lambda != NULL) { free(lambda); free(raw); free(sigma), free(dark); free(ref); free(refl); }
 				return 5;
 
 			} else {
@@ -1998,6 +2165,7 @@ static int LoadData(FILM_MEASURE_INFO *info, char *path) {
 					lambda[ipt] = strtod(aptr, &aptr); while (isspace(*aptr) || *aptr == ',') aptr++;
 					refl[ipt]   = strtod(aptr, &aptr); while (isspace(*aptr) || *aptr == ',') aptr++;
 					raw[ipt]    = strtod(aptr, &aptr); while (isspace(*aptr) || *aptr == ',') aptr++;
+					sigma[ipt]  = strtod(aptr, &aptr); while (isspace(*aptr) || *aptr == ',') aptr++;
 					dark[ipt]   = strtod(aptr, &aptr); while (isspace(*aptr) || *aptr == ',') aptr++;
 					ref[ipt]    = strtod(aptr, &aptr); 
 				}
@@ -2009,7 +2177,7 @@ static int LoadData(FILM_MEASURE_INFO *info, char *path) {
 		/* Verify we got all the implied data */
 		if (ipt != npt) {
 			MessageBox(HWND_DESKTOP, "NPT and actual number of data points in the file do not match.  Don't believe this is a valid file", "File read failure", MB_ICONERROR | MB_OK);
-			if (lambda != NULL) { free(lambda); free(raw); free(dark); free(ref); free(refl); }
+			if (lambda != NULL) { free(lambda); free(raw); free(sigma), free(dark); free(ref); free(refl); }
 			return 6;
 		}
 
@@ -2028,7 +2196,7 @@ static int LoadData(FILM_MEASURE_INFO *info, char *path) {
 		memcpy(info->cv_dark->x, lambda, npt*sizeof(double));	memcpy(info->cv_dark->y, dark, npt*sizeof(double));
 		memcpy(info->cv_ref->x,  lambda, npt*sizeof(double));	memcpy(info->cv_ref->y,  ref,  npt*sizeof(double));
 		memcpy(info->cv_refl->x, lambda, npt*sizeof(double));	memcpy(info->cv_refl->y, refl, npt*sizeof(double));
-
+																				memcpy(info->cv_refl->s, sigma, npt*sizeof(double));
 		/* Now update the screen everywhere */
 		/* We have loaded xmin/xmax ... need to reset these values in the
 		 * structure and mark that the lambda array is "invalid" for next
@@ -2108,8 +2276,16 @@ static int LoadData(FILM_MEASURE_INFO *info, char *path) {
 static int WriteProfileInfo(HWND hdlg, FILM_MEASURE_INFO *info) {
 	static char *rname = "WriteProfileInfo";
 
-	char szBuf[256], layer[20];
+	char szBuf[256], layer[20], *aptr;
 	int i, imat;
+
+	/* Address of the spectrometer */
+	if ( (aptr = ComboBoxGetPtrValue(hdlg, IDL_SPEC_IP)) != NULL) {
+		sprintf_s(szBuf, sizeof(szBuf), "%s", aptr);
+	} else {
+		GetDlgItemText(hdlg, IDV_SPEC_IP, szBuf, sizeof(szBuf));
+	}
+	WritePrivateProfileString("Server", "IP_Address", szBuf, IniFile);
 
 	/* Graph X-axis scaling */
 	sprintf_s(szBuf, sizeof(szBuf), "%g %g", info->lambda_min, info->lambda_max);
@@ -2173,8 +2349,30 @@ static int ReadProfileInfo(HWND hdlg, FILM_MEASURE_INFO *info) {
 	static char *rname = "ReadProfileInfo";
 
 	char szBuf[256], layer[20], *aptr;
-	int i, imat;
+	int i, inull, imat, icnt;
 	double xmin, xmax;
+
+	/* Address of the spectrometer */
+	GetPrivateProfileString("Server", "IP_Address", NULL, szBuf, sizeof(szBuf), IniFile);
+	if (*szBuf != '\0') {
+		strcpy_s(info->spec_IP, sizeof(info->spec_IP), szBuf);		/* Set in info */
+		
+		if (CB_ERR != (icnt = SendDlgItemMessage(hdlg, IDL_SPEC_IP, CB_GETCOUNT, 0,0)) ) {	
+			inull = -1;
+			for (i=0; i<=icnt; i++) {											/* icnt is 0 base (1 => 2 entries) */
+				aptr = (char *) SendDlgItemMessage(hdlg, IDL_SPEC_IP, CB_GETITEMDATA, (WPARAM) i, (LPARAM) 0);
+				if (aptr == NULL && inull == -1) {							/* Assume the first is the "manual" entry */
+					inull = i;
+				} else {
+					if (0 == _stricmp(szBuf, aptr)) break;					/* Matching values - select this one */
+				}
+			}
+			if (i > icnt) i = max(0, inull);
+			ComboBoxSetByIndex(hdlg, IDL_SPEC_IP, i);
+			SetDlgItemText(hdlg, IDV_SPEC_IP, szBuf);
+		}
+	}
+
 
 	/* Graph X-axis scaling */
 	GetPrivateProfileString("Graph", "Lambda_Range", NULL, szBuf, sizeof(szBuf), IniFile);
@@ -2725,6 +2923,28 @@ static int nls_deriv(double *results, NLS_DATA *nls, int ipt) {
 
 
 /* ===========================================================================
+-- Do quick estimate of normalization and sigma for a brute-force search
+=========================================================================== */
+double Estimate_Chisqr(int npt, double *x, double *y, double *s, double *f, double *pscaling) {
+	int i;
+	double ysum, fsum, scaling, chisqr;
+
+	/* Calculate a normalization factor so sum(y) = sum(f) */
+	ysum = fsum = 0;
+	for (i=0; i<npt; i++) { ysum += y[i]; fsum += f[i]; }
+	scaling = ( ysum != 0 ) ? fsum / ysum : 1.0 ;
+
+	/* Calculate simplified chisqr */
+	for (i=0,chisqr=0; i<npt; i++) {
+		chisqr += pow( (scaling*y[i]-f[i])/s[i], 2);
+	}
+
+	/* Return values */
+	if (pscaling != NULL) *pscaling = scaling;
+	return chisqr / (npt-1);
+}		
+
+/* ===========================================================================
 --- Do fit
 =========================================================================== */
 #define	MAXITER	(20)							/* Max iterations to find solution */
@@ -2787,17 +3007,77 @@ static int do_fit(HWND hdlg, FILM_MEASURE_INFO *info) {
 		j++;
 	}
 	/* And then add in the scaling factor (always appropriate for small changes in illumination intensity) */
-	nls->vars[j] = &info->sample.scaling;
+	nls->vars[j]  = &info->sample.scaling;
 	nls->lower[j] = info->fit_parms.scaling_min;
 	nls->upper[j] = info->fit_parms.scaling_max;
 	var_names[j] = "scaling";
 	j++;
 	nls->nvars = j;
 
-	/* Initialize everything else in CurveFit routine */
+	/* Initialize everything else in CurveFit routine (will use below) */
 	if ( (rcode = CurveFit(NKEY_INIT, 0, nls)) != 0) {
 		printf("ERROR: Error on initialization of routine\n"); fflush(stdout);
 		goto FitExit;
+	}
+
+/* ------------- SPECIAL CASE FOR ONLY 1 THICKNESS VARYING -------------------
+-- Do a 10-pt linear search over min/max range and choose lowest chi^2 as
+-- starting point.  This should at least get the right # of fringes
+--------------------------------------------------------------------------- */
+	if (nls->nvars == 2) {											/* One thickness varying */
+		double guess, best, initial, chi, chi_best, scaling, scaling_best;
+		int npt;
+
+		static double *x=NULL, *y=NULL, *s=NULL, *f=NULL;	/* Compress the spectrum by 10x to make fast */
+		static int nsize=-1;											/* Avoid continuously allocating / deallocating */
+		
+		if (nsize != info->npt/10 || x == NULL) {				/* Do we need to change allocated size? */
+			nsize = info->npt / 10;
+			x = realloc(x, nsize*sizeof(*x));
+			y = realloc(y, nsize*sizeof(*y));
+			s = realloc(s, nsize*sizeof(*s));
+			f = realloc(f, nsize*sizeof(*f));
+		}
+
+		/* Copy the useful data (every 10th point) */
+		for (i=0,j=0; i<info->npt; i+=10) {
+			if (! nls->valid[i]) continue;
+			x[j] = info->lambda[i];
+			y[j] = nls->data[i];
+			s[j] = nls->errorbar[i];
+			j++;
+		}
+		npt = j;															/* Number of points remaining */
+
+		if (npt > 5) {													/* Don't bother if too few */
+			initial = best = *nls->vars[0];						/* Originally suggested point */ 
+			TFOC_GetReflData(info->sample.tfoc, 1.0, 0.0, UNPOLARIZED, 300.0, npt, x, f);
+			chi_best = Estimate_Chisqr(npt, x, y, s, f, NULL);
+
+			for (guess=nls->lower[0]; guess<=nls->upper[0]; guess+=10.0) {
+				*nls->vars[0] = guess;
+				TFOC_GetReflData(info->sample.tfoc, 1.0, 0.0, UNPOLARIZED, 300.0, npt, x, f);
+				chi = Estimate_Chisqr(npt, x, y, s, f, &scaling);
+//				fprintf(stderr, "%.2f %.0f\n", *nls->vars[0], chi); fflush(stderr);
+				if (chi < chi_best) {							/* Better point */
+					best = *nls->vars[0];
+					chi_best = chi;
+					scaling_best = scaling;
+				}
+			}
+			*nls->vars[0] = initial;								/* Reset now */
+
+			/* If we have a better initial guess, put it in place now */
+			if (best != initial) {
+				*nls->vars[0] = best;
+				info->sample.scaling = scaling_best;
+
+				/* Fake last things that NKEY_INIT would have done */
+				(*nls->evalfnc)(nls);							/* Evaluate at this point */
+				(*nls->evalchi)(nls);							/* Get the chi^2 value */
+				nls->chiold = nls->chisqr;						/* Internal cleanup to keep NLSFIT synchronized (see curfit.c) */
+			}
+		}
 	}
 
 	/* And we are off and running */
@@ -2891,18 +3171,23 @@ FitExit:
 		}
 
 		/* Do we want to log these results? */
-		if (GetDlgItemCheck(hdlg, IDC_LOG_REFINES)) {
+		if (GetDlgItemCheck(hdlg, IDC_LOG_FITS)) {
 			FILE *funit;
 			char pathname[PATH_MAX];
+			static time_t time_0=0;
+			
+			if (time_0 == 0) time_0 = time(NULL);
 
 			GetDlgItemText(hdlg, IDV_LOGFILE, pathname, sizeof(pathname));
-			if (*pathname == '\0' || fopen_s(&funit, pathname, "a") != 0) {
+			if (*pathname == '\0') {
 				Beep(ERROR_BEEP_FREQ, ERROR_BEEP_MS);
-				SetDlgItemCheck(hdlg, IDC_LOG_REFINES, FALSE);
-				EnableDlgItem(hdlg, IDV_LOGFILE, FALSE);
-				EnableDlgItem(hdlg, IDB_EDIT_LOGFILE, FALSE);
+				strcpy_s(pathname, sizeof(pathname), "logfile.csv");
+				SetDlgItemText(hdlg, IDV_LOGFILE, pathname);
+			}
+			if (fopen_s(&funit, pathname, "a") != 0) {
+				Beep(ERROR_BEEP_FREQ, ERROR_BEEP_MS);
 			} else {
-				fprintf(funit, "%lld", time(NULL));
+				fprintf(funit, "%lld,%lld", time(NULL),time(NULL)-time_0);
 				for (i=0; i<nls->nvars; i++) {
 					fprintf(funit, ",%g,%g", *nls->vars[i], nls->sigma[i]*sqrt(nls->chisqr));
 				}
