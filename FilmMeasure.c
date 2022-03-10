@@ -2165,7 +2165,7 @@ static int LoadData(FILM_MEASURE_INFO *info, char *path) {
 					lambda[ipt] = strtod(aptr, &aptr); while (isspace(*aptr) || *aptr == ',') aptr++;
 					refl[ipt]   = strtod(aptr, &aptr); while (isspace(*aptr) || *aptr == ',') aptr++;
 					raw[ipt]    = strtod(aptr, &aptr); while (isspace(*aptr) || *aptr == ',') aptr++;
-					sigma[ipt]  = strtod(aptr, &aptr); while (isspace(*aptr) || *aptr == ',') aptr++;
+//					sigma[ipt]  = strtod(aptr, &aptr); while (isspace(*aptr) || *aptr == ',') aptr++;
 					dark[ipt]   = strtod(aptr, &aptr); while (isspace(*aptr) || *aptr == ',') aptr++;
 					ref[ipt]    = strtod(aptr, &aptr); 
 				}
