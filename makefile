@@ -31,20 +31,20 @@ LIBS = tfoc.lib
 
 SYSLIBS = user32.lib comctl32.lib gdi32.lib comdlg32.lib WS2_32.lib
 
-ALL: FilmMeasure.exe test.exe
+ALL: FilmMeasure.exe FilmMeasure_client.obj client.exe
 
-INSTALL: z:\lab\exes\FilmMeasure.exe
+INSTALL: z:\lab\exes\FilmMeasure.exe z:\lab\exes\client.exe
 
 CLEAN:
 	rm *.obj *.exe *.res win32ex.c win32ex.h graph.c graph.h server_support.c server_support.h
 
-OBJS = FilmMeasure.obj spec_client.obj server_support.obj win32ex.obj graph.obj curfit.obj FilmMeasure.res 
+OBJS = FilmMeasure.obj FilmMeasure_server.obj spec_client.obj server_support.obj win32ex.obj graph.obj curfit.obj FilmMeasure.res 
 
 FilmMeasure.exe : $(OBJS)
 	$(CC) -FeFilmMeasure.exe $(CFLAGS) $(OBJS) $(LIBS) $(SYSLIBS) /link  /NODEFAULTLIB:LIBCMT
 
-test.exe : test.obj spec_client.obj server_support.obj 
-	$(CC) -Fetest.exe $(CFLAGS) test.obj spec_client.obj server_support.obj $(SYSLIBS)
+client.exe : FilmMeasure_client.c FilmMeasure_client.h server_support.obj server_support.h
+	$(CC) -Feclient.exe -DLOCAL_CLIENT_TEST $(CFLAGS) FilmMeasure_client.c server_support.obj $(SYSLIBS)
 
 .c.obj:
 	$(CC) $(CFLAGS) -c -Fo$@ $<
@@ -57,6 +57,9 @@ test.exe : test.obj spec_client.obj server_support.obj
 z:\lab\exes\FilmMeasure.exe : FilmMeasure.exe
 	copy $** $@
 
+z:\lab\exes\client.exe : client.exe
+	copy $** $@
+
 # ---------------------------------------------------------------------------
 # Support modules 
 # ---------------------------------------------------------------------------
@@ -66,17 +69,23 @@ graph.h : \code\Window_Classes\graph\graph.h
 graph.c : \code\Window_Classes\graph\graph.c
 	copy $** $@
 
+graph.obj : graph.h
+
 win32ex.h : \code\Window_Classes\win32ex\win32ex.h
 	copy $** $@
 
 win32ex.c : \code\Window_Classes\win32ex\win32ex.c
 	copy $** $@
 
+win32ex.obj : win32ex.h 
+
 server_support.c : \code\lab\Server_Support\server_support.c
 	copy $** $@
 
 server_support.h : \code\lab\Server_Support\server_support.h
 	copy $** $@
+
+server_support.obj : server_support.h
 
 spec.h : ..\spec\spec.h
 	copy $** $@
@@ -91,10 +100,6 @@ FilmMeasure.obj : filmmeasure.h spec.h spec_client.h graph.h win32ex.h server_su
 
 FilmMeasure.res : FilmMeasure.rc resource.h
 
-graph.obj : graph.h
-
-server_support.obj : server_support.h
-
-win32ex.obj : win32ex.h 
+FilmMeasure_server.obj : server_support.h Spec.h FilmMeasure.h FilmMeasure_client.h 
 
 curfit.obj : curfit.h

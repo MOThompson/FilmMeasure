@@ -156,7 +156,7 @@ int RunServer(char *pname, unsigned short port, void (*ClientHandler)(void *), v
 	name[sizeof(name)-1] = '\0';				/* Ensure null terminated */
 
 /* Make sure we can inititiate and have sockets available */
-	if (InitSockets() != 0) return 3;
+	if (MyInitSockets() != 0) return 3;
 
 /* Create a socket to listen for clients */
 	if ( (m_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)) == INVALID_SOCKET ) {
@@ -266,7 +266,7 @@ CLIENT_DATA_BLOCK *ConnectToServer(char *name, char *IP_address, int port, int *
 	*err = 0;										/* And assume success */
 
 	/* Make sure we can actually use sockets in this program */
-	if (InitSockets() != 0) {						/* Make sure socket support has been initialized */
+	if (MyInitSockets() != 0) {						/* Make sure socket support has been initialized */
 		fprintf(stderr, "ERROR[%s]: Socket initialization failed\n", rname); fflush(stderr);
 		*err = 1; return NULL;
 	}
@@ -409,7 +409,7 @@ int GetSocketMsg(SOCKET socket, CS_MSG *request, void **pdata) {
 	icnt = recv(socket, (char *) request, sizeof(*request), 0);
 	if (icnt == 0) return 1;
 	if (icnt == SOCKET_ERROR) {
-		if (DebugLevel >= 1) { fprintf(stderr, "ERROR: recv() returned SOCKET_ERROR - assuming client terminated\n"); fflush(stderr); }
+		if (DebugLevel >= 1) { fprintf(stderr, "ERROR: recv() returned SOCKET_ERROR - likely other end terminated\n"); fflush(stderr); }
 		return 2;
 	}
 	request->msg      = ntohl(request->msg);
@@ -433,7 +433,7 @@ int GetSocketMsg(SOCKET socket, CS_MSG *request, void **pdata) {
 			if (icnt == 0) {
 				return 1;
 			} else if (icnt == SOCKET_ERROR) {
-				fprintf(stderr, "ERROR[%s]: recv() returned SOCKET_ERROR -- assuming client has been terminated\n", rname);
+				fprintf(stderr, "ERROR[%s]: recv() returned SOCKET_ERROR -- assuming other end has been terminated\n", rname);
 				fflush(stderr);
 				return 2;
 			}
@@ -504,9 +504,19 @@ int SendSocketMsg(SOCKET socket, CS_MSG reply, void *data) {
 	reply.data_len = htonl(reply.data_len);
 	reply.crc32    = htonl(reply.crc32);
 	icnt = send(socket, (char *) &reply, sizeof(reply), 0);
+	if (icnt != sizeof(reply)) {
+		fprintf(stderr, "SendSocketMsg: send() tried to send %d bytes but return was only %d\n", sizeof(reply), icnt);
+		fflush(stderr);
+	}
 
 	/* If there is any additional data to send, do so now */
-	if (isend > 0) icnt = send(socket, data, isend, 0);
+	if (isend > 0) {
+		icnt = send(socket, data, isend, 0);
+		if (icnt != isend) {
+			fprintf(stderr, "SendSocketMsg: send() of additional data tried to send %d bytes but return was only %d\n", isend, icnt);
+			fflush(stderr);
+		}
+	}
 
 	return 0;
 }
@@ -565,7 +575,7 @@ int StandardServerExchange(CLIENT_DATA_BLOCK *block, CS_MSG request, void *send_
 /* ===========================================================================
 -- Routines to initialize socket support (OS dependent)
 --
--- Usage: int InitSockets(void);
+-- Usage: int MyInitSockets(void);
 --        int ShutdownSockets(void);
 --
 -- Inputs: none
@@ -574,41 +584,43 @@ int StandardServerExchange(CLIENT_DATA_BLOCK *block, CS_MSG request, void *send_
 --
 -- Return: 0 if successful, !0 for errors
 --
--- Notes: (1) It is safe to call Init_Sockets() multiple times.  Will simply
---            return 0 if already initialized
---        (2) For WIN32, calls WSAStartup() for socket interfaces and then
+-- Notes: (1) MyInitSockets() can be called multiple times with no impact
+--        (2) Current ShutdownSockets() does nothing
+--        (3) For WIN32, calls WSAStartup() for socket interfaces and then
 --            WSACleanup() at shutdown.  The WSACleanup() isn't really 
 --            necessary but good to implement to be clean
---        (3) For Linux, sockets are automagically available
+--        (4) For Linux, sockets are automagically available
 =========================================================================== */
 static BOOL Socket_Interface_Initialized = FALSE;
-static sig_atomic_t socket_init_count = 0;
 
-int InitSockets(void) {
+int MyInitSockets(void) {
+	static char *rname = "MyInitSockets";
 
 #ifdef _WIN32
-	if (socket_init_count == 0) {
-		int iResult;
-		WSADATA wsaData;
+	int rc;
+	WSADATA wsaData;
+
+	/* Allow multiple calls with no effect */
+	if (Socket_Interface_Initialized) return 0;
 
 	/* Initialize Winsock. */
-		iResult = WSAStartup( MAKEWORD(2,2), &wsaData );
-		if ( iResult != NO_ERROR ) {
-			fprintf(stderr, "Error at WSAStartup()\n"); fflush(stderr);
-			return 1;
-		}
+	rc = WSAStartup( MAKEWORD(2,2), &wsaData );
+	if ( rc != NO_ERROR ) {
+		fprintf(stderr, "ERROR[%s]: Error at WSAStartup().  rc=%d\n", rname, rc); fflush(stderr);
+		return 1;
 	}
 #endif
 
-	socket_init_count++;				/* Keep track for shutdowns */
+	/* Either we don't have to worry about it (Linux), or is successful */
+	Socket_Interface_Initialized = TRUE;
 	return 0;
 }
 
 /* For moment, this just keeps track of the count.  For Win32, might
  * call WSACleanup() when nothing left needed */
 int ShutdownSockets(void) {
-
-	if (socket_init_count != 0) socket_init_count--;
+	static char *rname = "ShutdownSockets";
+//	WSACleanup();											/* Don't call ... just let occur on program termination */
 	return 0;
 }
 

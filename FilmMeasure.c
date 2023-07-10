@@ -43,15 +43,19 @@
 /* ------------------------------ */
 /* Local include files            */
 /* ------------------------------ */
-#include "server_support.h"		/* Server support */
-#include "spec.h"						/* Access to the spectrometer information */
-#include "spec_client.h"			/* For prototypes				*/
 #include "win32ex.h"
 #include "graph.h"
 #include "resource.h"
 #include "tfoc.h"
 #include "curfit.h"
+
+#include "server_support.h"		/* Server support */
+#include "spec.h"						/* Access to the spectrometer information */
+#include "spec_client.h"			/* For prototypes				*/
+
+#define	FILM_KERNAL
 #include "filmmeasure.h"			/* Depends on structures in previous .h */
+#include "filmmeasure_server.h"
 
 /* ------------------------------- */
 /* My local typedef's and defines  */
@@ -97,8 +101,8 @@ static int do_fit(HWND hdlg, FILM_MEASURE_INFO *info);
 
 static int QueryLogfile(HWND hdlg, int wID);
 static int QueryTimeSeriesFile(HWND hdlg, char *path, int pathlen);
-static int SaveData(FILM_MEASURE_INFO *info, char *fname);
-static int LoadData(FILM_MEASURE_INFO *info, char *path);
+static int SaveData(FILM_MEASURE_INFO *info, char *path, BOOL server_call);
+static int LoadData(FILM_MEASURE_INFO *info, char *path, BOOL server_call);
 static int WriteProfileInfo(HWND hdlg, FILM_MEASURE_INFO *info);
 static int ReadProfileInfo(HWND hdlg, FILM_MEASURE_INFO *info);
 
@@ -158,6 +162,9 @@ int WINAPI WinMain(HINSTANCE hThisInst, HINSTANCE hPrevInst, LPSTR lpszArgs, int
 	hInstance = hThisInst;
 	DialogBoxParam(hInstance, "FILMMEASURE_DIALOG", HWND_DESKTOP, (DLGPROC) MainDlgProc, (LPARAM) main_info);			/* For re-entrant, use the previous saved values */
 
+	/* And shut down the Spec server */
+	Shutdown_FilmMeasure_Server();
+
 	return 0;
 }
 
@@ -175,6 +182,8 @@ int WINAPI WinMain(HINSTANCE hThisInst, HINSTANCE hPrevInst, LPSTR lpszArgs, int
 -- Return: return code, generally BOOL
 =========================================================================== */
 #define	TIMER_AUTO_MEASURE			(3)
+
+FILM_MEASURE_INFO *last_info;													/* For server calls that may not have this information otherwise */
 
 INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) {
 	static char *rname = "MainDlgProc";
@@ -235,7 +244,7 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 	int *hptr;
 
 /* Recover the information data associated with this window */
-	if (msg != WM_INITDIALOG) info = (FILM_MEASURE_INFO *) GetWindowLongPtr(hdlg, GWLP_USERDATA);
+	if (msg != WM_INITDIALOG) last_info = info = (FILM_MEASURE_INFO *) GetWindowLongPtr(hdlg, GWLP_USERDATA);
 
 /* The message loop */
 	switch (msg) {
@@ -284,7 +293,8 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 
 			/* Save the information structure in the dialog box info parameter */
 			SetWindowLongPtr(hdlg, GWLP_USERDATA, (LONG) info);
-
+			last_info = info;
+			
 			/* Copy default IP address and try to connect to the LasGo client/server */
 			/* Due to the possible timeouts on making connections, do as a thread */
 			/* Fill in combo boxes and select default value */
@@ -343,6 +353,9 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 			SetDlgItemText(hdlg, IDV_TIMESERIES_PATH, info->TimeSeries_Path);
 			SetDlgItemText(hdlg, IDB_TIMESERIES, "Start");
 			SetRadioButton(hdlg, IDR_TIMESERIES_REFL, IDR_TIMESERIES_RAW, IDR_TIMESERIES_REFL);
+
+			/* Initialize the Spec TCP server for remote image requests */
+			Init_FilmMeasure_Server();
 
 			rcode = TRUE; break;
 
@@ -1429,11 +1442,11 @@ INT_PTR CALLBACK MainDlgProc(HWND hdlg, UINT msg, WPARAM wParam, LPARAM lParam) 
 					rcode = TRUE; break;
 
 				case IDB_SAVE_DATA:
-					if (BN_CLICKED == wNotifyCode) SaveData(info, NULL);
+					if (BN_CLICKED == wNotifyCode) SaveData(info, NULL, FALSE);
 					rcode = TRUE; break;
 
 				case IDB_LOAD_DATA:
-					if (BN_CLICKED == wNotifyCode) LoadData(info, NULL);
+					if (BN_CLICKED == wNotifyCode) LoadData(info, NULL, FALSE);
 					rcode = TRUE; break;
 
 				case IDV_MEASURE_DELAY:
@@ -1808,6 +1821,7 @@ static int QueryTimeSeriesFile(HWND hdlg, char *path, int pathlen) {
 
 	/* Do we have a specified filename?  If not, query via dialog box */
 	strcpy_m(pathname, sizeof(pathname), "timeseries.csv");	/* Pathname must be initialized with a value */
+	memset(&ofn, 0, sizeof(ofn));						/* Not static, must be set to zeros */
 	ofn.lStructSize       = sizeof(OPENFILENAME);
 	ofn.hwndOwner         = hdlg;
 	ofn.lpstrTitle        = "TimeSeries Filename";
@@ -1857,6 +1871,7 @@ static int QueryLogfile(HWND hdlg, int wID) {
 
 	/* Do we have a specified filename?  If not, query via dialog box */
 	strcpy_m(pathname, sizeof(pathname), "logfile.csv");	/* Pathname must be initialized with a value */
+	memset(&ofn, 0, sizeof(ofn));						/* Not static, must be set to zeros */
 	ofn.lStructSize       = sizeof(OPENFILENAME);
 	ofn.hwndOwner         = hdlg;
 	ofn.lpstrTitle        = "Measurement log file";
@@ -1888,37 +1903,37 @@ static int QueryLogfile(HWND hdlg, int wID) {
 /* ===========================================================================
 -- Save all the important data for current measurement
 --
--- Usage: int SaveData(HWND hdlg, FILM_MEASURE_INFO *info, char *path);
+-- Usage: int SaveData(HWND hdlg, FILM_MEASURE_INFO *info, char *path, BOOL server_call);
 --
 -- Inputs: info - pointer to all the information about measurements
 --         path - NULL for dialog box or specific pathname for saving
+--         server_call - was this a result of a server call rather than dialog box
 --
 -- Output: generates standard save file (normally .csv)
 --
 -- Returns: 0 if successful, !0 on any errors or cancel
 =========================================================================== */
-static int SaveData(FILM_MEASURE_INFO *info, char *path) {
+static int SaveData(FILM_MEASURE_INFO *info, char *path, BOOL server_call) {
 	static char *rname = "SaveData";
 
 	static char local_dir[PATH_MAX]="";						/* Directory -- keep for multiple calls */
 
-	int i, imat;
+	int i, imat, rc;
 	FILE *funit;
 	OPENFILENAME ofn;
 	struct tm timenow;
 	time_t tnow;
 	char szBuf[256];
 	char pathname[1024];											/* Pathname - save for multiple calls */
-	HWND hdlg;
-
-	/* This is needed so much, assign now */
-	hdlg = info->hdlg;
 
 	/* Do we have a specified filename?  If not, query via dialog box */
-	if (path == NULL) {
+	if (path == NULL && server_call) {
+		strcpy_m(pathname, sizeof(pathname), "server_spectrum_data.dat");
+	} else if (path == NULL) {
 		strcpy_m(pathname, sizeof(pathname), "film_data");	/* Pathname must be initialized with a value */
+		memset(&ofn, 0, sizeof(ofn));						/* Not static, must be set to zeros */
 		ofn.lStructSize       = sizeof(OPENFILENAME);
-		ofn.hwndOwner         = info->hdlg;
+		ofn.hwndOwner         = (info != NULL) ? info->hdlg : NULL ;
 		ofn.lpstrTitle        = "Save film measurement";
 		ofn.lpstrFilter       = "text data (*.dat)\0*.dat\0Excel csv file (*.csv)\0*.csv\0All files (*.*)\0*.*\0\0";
 		ofn.lpstrCustomFilter = NULL;
@@ -1944,8 +1959,9 @@ static int SaveData(FILM_MEASURE_INFO *info, char *path) {
 		strcpy_s(pathname, sizeof(pathname), path);
 	}
 
-	if (fopen_s(&funit, pathname, "w") != 0) {
-		MessageBox(HWND_DESKTOP, "File failed to open for write", "File write failure", MB_ICONWARNING | MB_OK);
+	if ( (rc = fopen_s(&funit, pathname, "w")) != 0) {
+		fprintf(stderr, "File \"%s\" failed to open for write (rc = %d)\n", pathname, rc); fflush(stderr);
+		if (! server_call) MessageBox(HWND_DESKTOP, "File failed to open for write", "File write failure", MB_ICONWARNING | MB_OK);
 		return 2;
 	} else {
 		fprintf(funit, "# FilmMeasure spectrum v1.0\n");
@@ -1989,16 +2005,18 @@ static int SaveData(FILM_MEASURE_INFO *info, char *path) {
 	return 0;
 }
 
+
 /* ===========================================================================
 -- Load data from a saved structure
 --
--- Usage: int LoadData(FILM_MEASURE_INFO *info, char *path);
+-- Usage: int LoadData(FILM_MEASURE_INFO *info, char *path, BOOL server_call);
 --
 -- Inputs: info - pointer to all the information about measurements
 --         path - NULL for dialog box or specific pathname for reading
 --
 -- Output: overwrites lambda, raw, dark, ref, and refl with data from file
 --         marks curves as existing unless all the data is zero (not saved)
+--         server_call - was this a result of a server call rather than dialog box
 --
 -- Returns: 0 if successful, !0 on any errors or cancel
 --
@@ -2009,8 +2027,8 @@ static int SaveData(FILM_MEASURE_INFO *info, char *path) {
 --        the wavelength data corresponding to the spectrometer and overwrite
 --        the values loaded.
 =========================================================================== */
-static int LoadData(FILM_MEASURE_INFO *info, char *path) {
-	static char *rname = "FileSaveData";
+static int LoadData(FILM_MEASURE_INFO *info, char *path, BOOL server_call) {
+	static char *rname = "LoadData";
 
 	static char local_dir[PATH_MAX]="";					/* Directory -- keep for multiple calls */
 
@@ -2032,6 +2050,7 @@ static int LoadData(FILM_MEASURE_INFO *info, char *path) {
 	/* Do we have a specified filename?  If not, query via dialog box */
 	if (path == NULL) {
 		*pathname = '\0';										/* No initialization */
+		memset(&ofn, 0, sizeof(ofn));						/* Not static, must be set to zeros */
 		ofn.lStructSize       = sizeof(OPENFILENAME);
 		ofn.hwndOwner         = info->hdlg;
 		ofn.lpstrTitle        = "Load film measurement";
@@ -3199,4 +3218,30 @@ FitExit:
 
 	fflush(NULL);
 	return rcode;
+}
+
+/* ===========================================================================
+-- Simple routines to handle server requests with minimal internal information
+--
+-- Note that they are prototypes in FilmMeasure_server.h, not FilmMeasure.h
+=========================================================================== */
+int FilmMeasure_Do_Measure(void) {
+	SendMessage(last_info->hdlg, WM_COMMAND, MAKEWPARAM(IDB_MEASURE, BN_CLICKED), 0L);
+	return 0;
+}
+
+int FilmMeasure_Save_Data(char *path) {
+	return SaveData(last_info, path, TRUE);
+}
+
+int FilmMeasure_Query_Fit_Parms(int *nvars, double *vars, int max_vars) {
+	int i,j;
+
+	for (i=0,j=0; i<N_FILM_STACK && j<max_vars-1; i++) {
+		if (last_info->sample.imat[i] != 0) vars[j++] = last_info->sample.nm[i];
+	}
+	vars[j++] = last_info->sample.scaling;
+	*nvars = j;
+
+	return 0;
 }

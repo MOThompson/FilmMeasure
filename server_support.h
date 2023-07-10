@@ -21,6 +21,8 @@
 		#define	SD_BOTH		(2)
 	#endif
 
+	int MyInitSockets(void);			/* Expose for Lasgo_Client */
+
 #elif __linux__
 
 	#include <arpa/inet.h>
